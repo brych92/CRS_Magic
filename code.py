@@ -1,459 +1,46 @@
 import json
 import os
-import re
-from qgis.PyQt.QtGui import QIcon
-from qgis.PyQt.QtWidgets import QAction, QApplication
-from qgis.core import Qgis, QgsApplication, QgsVectorLayer, QgsProject, QgsMapLayerType, QgsCoordinateTransform, QgsCsException, QgsCoordinateReferenceSystem,\
-    QgsWkbTypes, QgsGeometry, QgsRectangle, QgsPointXY
-from qgis.PyQt.QtCore import Qt, QTimer, QSettings
+
+from qgis.PyQt.QtGui import QCursor, QDesktopServices, QIcon, QPixmap
+from qgis.PyQt.QtWidgets import QAction, QApplication, QMenu
+from qgis.core import (
+    Qgis,
+    QgsApplication,
+    QgsCoordinateReferenceSystem,
+    QgsCoordinateTransform,
+    QgsCoordinateTransformContext,
+    QgsGeometry,
+    QgsMapLayerType,
+    QgsMessageLog,
+    QgsProject,
+    QgsRectangle,
+    QgsVectorLayerFeatureSource,
+    QgsWkbTypes,
+)
+from qgis.PyQt.QtCore import Qt, QTimer, QSettings, QUrl
 from qgis.gui import QgsMapToolEmitPoint, QgsRubberBand
+
 from .find_crs import findCrs
-from PyQt5.QtWidgets import QMessageBox, QDialog, QVBoxLayout, QTextEdit, QPushButton, QLabel, QSizePolicy, \
-    QTableWidget, QTableWidgetItem, QHBoxLayout, QHeaderView, QAbstractItemView, QListWidget, QLineEdit, \
-    QPlainTextEdit, QDialogButtonBox, QWidget, QToolButton, QMenu
-from PyQt5.QtCore import Qt
-from PyQt5.QtGui import QFontMetrics, QCursor, QPixmap
+from .plugin_window import CRSResultsDialog
+from .settings_window import (
+    CRSSetSettingsDialog,
+    crs_sets_bundle_from_json_data,
+    crs_sets_to_json_data,
+)
+from .ua_SPT import uaSPT
 
 
 ALL_CRS_SET_KEY = '__all__'
-CRS_SETS_SETTINGS_KEY = 'CRS_Magic/crs_sets'
+DEFAULT_ACTIVE_CRS_SET = 'Ukraine - UCS/CS63'
 ACTIVE_CRS_SET_SETTINGS_KEY = 'CRS_Magic/active_crs_set'
-
-
-def normalize_crs_code(crs_code):
-    code = str(crs_code).strip().upper()
-    if not code:
-        return ''
-    if code.isdigit() and len(code) >= 4:
-        return f'EPSG:{code}'
-    if re.match(r'^[A-Z][A-Z0-9_]*:\d+$', code):
-        return code
-    return ''
-
-
-def parse_crs_codes(text):
-    cleaned_lines = []
-    for line in str(text or '').splitlines():
-        cleaned_lines.append(line.split('#', 1)[0])
-    cleaned_text = '\n'.join(cleaned_lines)
-    candidates = re.findall(r'[A-Za-z][A-Za-z0-9_]*:\d+|\b\d{4,}\b', cleaned_text)
-
-    result = []
-    known_codes = set()
-    for candidate in candidates:
-        code = normalize_crs_code(candidate)
-        if code and code not in known_codes:
-            result.append(code)
-            known_codes.add(code)
-    return result
-
-
-class CustomMessageBox(QDialog):
-    def __init__(self, title, message, parent=None):
-        super().__init__(parent)
-
-        self.setWindowTitle(title)
-
-        # Set the window icon
-        self.plugin_dir = os.path.dirname(__file__)
-        icon = QIcon(os.path.join(self.plugin_dir,"icon.png"))        
-        self.setWindowIcon(icon)
-
-        # Create a QLabel widget with HTML formatting
-        text_edit = QTextEdit()
-        
-        html_text=message.replace("\n", "<br>")
-        
-        text_edit.setHtml(html_text)
-        max_line_width = 0
-        font_metrics=QFontMetrics(text_edit.font())
-        for line in html_text.split('<br>'):
-            line_width = font_metrics.width(line)
-            max_line_width = max(max_line_width, line_width)
-        self.setMinimumWidth(int(max_line_width) + 20)
-        
-        line_height = font_metrics.height()
-        height=min(640,int(html_text.count('<br>')*line_height*1.5))
-        self.setMinimumHeight(height)
-        
-        text_edit.setReadOnly(True)
-        
-        # Create a QPushButton to close the dialog
-        ok_button = QPushButton('OK')
-        ok_button.clicked.connect(self.accept)
-
-        # Set up the layout
-        layout = QVBoxLayout()
-        layout.addWidget(text_edit)
-        layout.addWidget(ok_button)
-
-        self.setLayout(layout)
-
-
-class DistanceTableWidgetItem(QTableWidgetItem):
-    def __lt__(self, other):
-        left_value = self.data(Qt.UserRole)
-        right_value = other.data(Qt.UserRole)
-        if left_value is not None and right_value is not None:
-            return left_value < right_value
-        return super().__lt__(other)
-
-
-class CRSResultsDialog(QDialog):
-    def __init__(self, layers, iface, parent=None):
-        super().__init__(parent)
-        self.iface = iface
-        self.task = None
-        self.layers_by_id = {layer.id(): layer for layer in layers}
-        self.manual_layer_ids = set()
-        self.manual_result_text = {}
-        self.pending_results = []
-
-        self.setWindowTitle('CRS Magic - результати підбору')
-        self.plugin_dir = os.path.dirname(__file__)
-        icon = QIcon(os.path.join(self.plugin_dir, "icon.png"))
-        self.setWindowIcon(icon)
-        self.resize(820, 520)
-
-        self.table = QTableWidget(0, 3)
-        self.table.setHorizontalHeaderLabels(['Шар', 'СК', 'Відстань, м'])
-        self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
-        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
-        self.table.setSelectionMode(QAbstractItemView.SingleSelection)
-        self.table.setAlternatingRowColors(True)
-        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
-        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
-        self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
-        self.table.setSortingEnabled(True)
-        self.table.sortItems(2, Qt.AscendingOrder)
-        self.table.itemDoubleClicked.connect(self.apply_selected_crs)
-
-        self.status_label = QLabel('Очікуємо результати...')
-
-        self.cancel_button = QPushButton('Скасувати пошук')
-        self.cancel_button.clicked.connect(self.cancel_search)
-        self.close_button = QPushButton('Закрити')
-        self.close_button.clicked.connect(self.close)
-
-        buttons_layout = QHBoxLayout()
-        buttons_layout.addWidget(self.status_label)
-        buttons_layout.addStretch()
-        buttons_layout.addWidget(self.cancel_button)
-        buttons_layout.addWidget(self.close_button)
-
-        layout = QVBoxLayout()
-        layout.addWidget(self.table)
-        layout.addLayout(buttons_layout)
-        self.setLayout(layout)
-
-        self.flush_timer = QTimer(self)
-        self.flush_timer.setSingleShot(True)
-        self.flush_timer.setInterval(250)
-        self.flush_timer.timeout.connect(self.flush_pending_results)
-
-    def set_task(self, task):
-        self.task = task
-
-    def crs_label(self, crs_code, crs_name):
-        if crs_name:
-            return f'{crs_code} - {crs_name}'
-        return crs_code
-
-    def short_crs_label(self, crs_code, crs_name):
-        if crs_name and len(crs_name) > 100:
-            return f'{crs_code} - {crs_name[:100]}...'
-        return self.crs_label(crs_code, crs_name)
-
-    def add_result(self, layer_id, layer_name, crs_code, crs_name, distance, crs):
-        self.pending_results.append((layer_id, layer_name, crs_code, crs_name, distance, crs))
-        if not self.flush_timer.isActive():
-            self.flush_timer.start()
-
-    def flush_pending_results(self):
-        if not self.pending_results:
-            return
-
-        results = self.pending_results
-        self.pending_results = []
-        self.table.setSortingEnabled(False)
-        for layer_id, layer_name, crs_code, crs_name, distance, crs in results:
-            row = self.table.rowCount()
-            self.table.insertRow(row)
-
-            layer_item = QTableWidgetItem(layer_name)
-            crs_item = QTableWidgetItem(self.short_crs_label(crs_code, crs_name))
-            crs_item.setToolTip(self.crs_label(crs_code, crs_name))
-            distance_item = DistanceTableWidgetItem(f'{distance:,.0f}'.replace(',', ' '))
-            distance_item.setData(Qt.UserRole, distance)
-
-            for item in (layer_item, crs_item, distance_item):
-                item.setData(Qt.UserRole + 1, layer_id)
-                item.setData(Qt.UserRole + 2, crs)
-                item.setData(Qt.UserRole + 3, crs_code)
-                item.setData(Qt.UserRole + 4, distance)
-                item.setData(Qt.UserRole + 5, crs_name)
-
-            self.table.setItem(row, 0, layer_item)
-            self.table.setItem(row, 1, crs_item)
-            self.table.setItem(row, 2, distance_item)
-
-        self.table.setSortingEnabled(True)
-        self.table.sortItems(2, Qt.AscendingOrder)
-
-    def apply_selected_crs(self, *args):
-        if args and args[0]:
-            row = args[0].row()
-        else:
-            row = self.table.currentRow()
-        if row < 0:
-            return
-
-        layer_item = self.table.item(row, 0)
-        if not layer_item:
-            return
-
-        layer_id = layer_item.data(Qt.UserRole + 1)
-        crs = layer_item.data(Qt.UserRole + 2)
-        crs_code = layer_item.data(Qt.UserRole + 3)
-        distance = layer_item.data(Qt.UserRole + 4)
-        crs_name = layer_item.data(Qt.UserRole + 5)
-        layer = self.layers_by_id.get(layer_id)
-        if not layer or not crs:
-            return
-
-        layer.setCrs(crs)
-        self.manual_layer_ids.add(layer_id)
-        self.manual_result_text[layer_id] = f"{self.crs_label(crs_code, crs_name)} - {f'{distance:,.0f}'.replace(',', ' ')} метрів від точки кліку"
-        self.iface.mapCanvas().refreshAllLayers()
-        self.iface.messageBar().pushMessage(
-            f"[CRS Magic] Для шару '{layer.name()}' встановлено {self.crs_label(crs_code, crs_name)}",
-            Qgis.MessageLevel.Success,
-            3
-        )
-
-    def update_stats(self, total, processed, success, failed, matched):
-        rows_qty = self.table.rowCount() + len(self.pending_results)
-        self.status_label.setText(
-            f'Усього: {total} | Перевірено: {processed} | Успішно: {success} | '
-            f'Помилок/пропущено: {failed} | До 200 км: {matched} | У таблиці: {rows_qty}'
-        )
-
-    def has_manual_selection(self, layer_id):
-        return layer_id in self.manual_layer_ids
-
-    def manual_selection_text(self, layer_id):
-        return self.manual_result_text.get(layer_id, '')
-
-    def mark_finished(self):
-        self.flush_pending_results()
-        self.cancel_button.setEnabled(False)
-        self.status_label.setText(self.status_label.text() + ' | Готово')
-
-    def mark_failed(self, failure):
-        self.flush_pending_results()
-        self.cancel_button.setEnabled(False)
-        self.status_label.setText(f'Помилка: {failure}')
-
-    def cancel_search(self):
-        if self.task:
-            self.task.cancel()
-            self.status_label.setText(self.status_label.text() + ' | Скасування...')
-
-
-class CRSSetSettingsDialog(QDialog):
-    def __init__(self, crs_sets, parent=None):
-        super().__init__(parent)
-        self.crs_sets = {}
-        for name, codes in crs_sets.items():
-            normalized_codes = parse_crs_codes('\n'.join(codes))
-            if str(name).strip() and normalized_codes:
-                self.crs_sets[str(name).strip()] = normalized_codes
-
-        self.current_set_name = None
-        self.loading = False
-
-        self.setWindowTitle('CRS Magic - набори СК')
-        self.resize(720, 420)
-
-        self.sets_list = QListWidget()
-        self.sets_list.setMinimumWidth(190)
-        self.sets_list.currentItemChanged.connect(self.change_set)
-
-        self.add_button = QPushButton('Додати')
-        self.add_button.clicked.connect(self.add_set)
-        self.delete_button = QPushButton('Видалити')
-        self.delete_button.clicked.connect(self.delete_set)
-
-        set_buttons_layout = QHBoxLayout()
-        set_buttons_layout.addWidget(self.add_button)
-        set_buttons_layout.addWidget(self.delete_button)
-
-        left_layout = QVBoxLayout()
-        left_layout.addWidget(QLabel('Набори'))
-        left_layout.addWidget(self.sets_list)
-        left_layout.addLayout(set_buttons_layout)
-        left_widget = QWidget()
-        left_widget.setLayout(left_layout)
-
-        self.name_edit = QLineEdit()
-        self.codes_edit = QPlainTextEdit()
-        self.codes_edit.setPlaceholderText('EPSG:5562\nEPSG:5563\n4326')
-        self.codes_edit.textChanged.connect(self.update_count_label)
-        self.count_label = QLabel('Кодів у наборі: 0')
-
-        right_layout = QVBoxLayout()
-        right_layout.addWidget(QLabel('Назва набору'))
-        right_layout.addWidget(self.name_edit)
-        right_layout.addWidget(QLabel('Коди СК'))
-        right_layout.addWidget(self.codes_edit)
-        right_layout.addWidget(self.count_label)
-        right_widget = QWidget()
-        right_widget.setLayout(right_layout)
-
-        content_layout = QHBoxLayout()
-        content_layout.addWidget(left_widget)
-        content_layout.addWidget(right_widget, 1)
-
-        self.buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        self.buttons.accepted.connect(self.accept)
-        self.buttons.rejected.connect(self.reject)
-
-        layout = QVBoxLayout()
-        layout.addLayout(content_layout)
-        layout.addWidget(self.buttons)
-        self.setLayout(layout)
-
-        self.load_sets_list()
-        if self.sets_list.count():
-            self.sets_list.setCurrentRow(0)
-        else:
-            self.add_set()
-
-    def unique_set_name(self, base_name):
-        name = base_name
-        counter = 2
-        while name in self.crs_sets:
-            name = f'{base_name} {counter}'
-            counter = counter + 1
-        return name
-
-    def load_sets_list(self):
-        self.loading = True
-        self.sets_list.clear()
-        for name in sorted(self.crs_sets.keys()):
-            self.sets_list.addItem(name)
-        self.loading = False
-
-    def load_set(self, set_name):
-        self.loading = True
-        self.current_set_name = set_name
-        self.name_edit.setText(set_name)
-        self.codes_edit.setPlainText('\n'.join(self.crs_sets.get(set_name, [])))
-        self.update_count_label()
-        self.loading = False
-
-    def change_set(self, current, previous):
-        if self.loading:
-            return
-        if previous and not self.save_current_set():
-            self.loading = True
-            self.sets_list.setCurrentItem(previous)
-            self.loading = False
-            return
-        if current:
-            self.load_set(current.text())
-        else:
-            self.current_set_name = None
-            self.name_edit.clear()
-            self.codes_edit.clear()
-
-    def add_set(self):
-        if self.current_set_name and not self.save_current_set():
-            return
-
-        name = self.unique_set_name('Новий набір')
-        self.crs_sets[name] = []
-        self.sets_list.addItem(name)
-        self.sets_list.setCurrentRow(self.sets_list.count() - 1)
-        self.name_edit.selectAll()
-        self.name_edit.setFocus()
-
-    def delete_set(self):
-        current = self.sets_list.currentItem()
-        if not current:
-            return
-
-        answer = QMessageBox.question(
-            self,
-            'Видалити набір?',
-            f"Видалити набір '{current.text()}'?",
-            QMessageBox.Yes | QMessageBox.No,
-            QMessageBox.No
-        )
-        if answer != QMessageBox.Yes:
-            return
-
-        row = self.sets_list.row(current)
-        self.crs_sets.pop(current.text(), None)
-        self.loading = True
-        self.sets_list.takeItem(row)
-        self.loading = False
-
-        if self.sets_list.count():
-            self.sets_list.setCurrentRow(min(row, self.sets_list.count() - 1))
-        else:
-            self.current_set_name = None
-            self.name_edit.clear()
-            self.codes_edit.clear()
-            self.update_count_label()
-
-    def save_current_set(self, show_warning=True):
-        if not self.current_set_name:
-            return True
-
-        new_name = self.name_edit.text().strip()
-        codes = parse_crs_codes(self.codes_edit.toPlainText())
-
-        if not new_name:
-            if show_warning:
-                QMessageBox.warning(self, 'Набір СК', 'Вкажіть назву набору.')
-            return False
-
-        if not codes:
-            if show_warning:
-                QMessageBox.warning(self, 'Набір СК', 'Додайте хоча б один код СК у набір.')
-            return False
-
-        if new_name != self.current_set_name and new_name in self.crs_sets:
-            if show_warning:
-                QMessageBox.warning(self, 'Набір СК', 'Набір з такою назвою вже існує.')
-            return False
-
-        current_item = self.sets_list.currentItem()
-        if new_name != self.current_set_name:
-            self.crs_sets.pop(self.current_set_name, None)
-            self.current_set_name = new_name
-            if current_item:
-                current_item.setText(new_name)
-
-        self.crs_sets[self.current_set_name] = codes
-        self.update_count_label()
-        return True
-
-    def update_count_label(self):
-        self.count_label.setText(f'Кодів у наборі: {len(parse_crs_codes(self.codes_edit.toPlainText()))}')
-
-    def result_sets(self):
-        return {
-            name: codes
-            for name, codes in self.crs_sets.items()
-            if name.strip() and codes
-        }
-
-    def accept(self):
-        if self.current_set_name and not self.save_current_set(True):
-            return
-        super().accept()
+FAST_MODE_SETTINGS_KEY = 'CRS_Magic/fast_mode'
+GROUP_SEARCH_SETTINGS_KEY = 'CRS_Magic/group_search'
+DISABLE_FALLBACK_HANDLER_SETTINGS_KEY = 'CRS_Magic/disable_fallback_handler'
+ALLOW_FALLBACK_SETTINGS_KEY = 'CRS_Magic/allow_fallback'
+ALLOW_BALLPARK_SETTINGS_KEY = 'CRS_Magic/allow_ballpark'
+INITIAL_CRS_SETS_VERSION = 1
+CRS_SETS_LIBRARY_DIRECTORY = 'CRS_Magic_finder'
+CRS_SETS_LIBRARY_FILE = 'crs_sets.json'
 
 
 class CRS_Magic:
@@ -474,58 +61,176 @@ class CRS_Magic:
         self.layers=[]
         self.selected_layers=[]
         self.results_dialog=None
+        self.action_reference = None
         self.settings = QSettings()
-        self.crs_sets = self.load_crs_sets()
+        (
+            self.crs_sets,
+            self.crs_set_metadata,
+            self.initial_crs_sets_version,
+        ) = self.load_crs_sets()
+        self.install_initial_crs_sets()
         self.active_crs_set = self.load_active_crs_set()
+        self.fast_mode = self.load_bool_setting(FAST_MODE_SETTINGS_KEY, False)
+        self.group_search = self.load_bool_setting(GROUP_SEARCH_SETTINGS_KEY, False)
+        self.disable_fallback_handler = self.load_bool_setting(
+            DISABLE_FALLBACK_HANDLER_SETTINGS_KEY,
+            True,
+        )
+        self.allow_fallback = self.load_bool_setting(ALLOW_FALLBACK_SETTINGS_KEY, True)
+        self.allow_ballpark = self.load_bool_setting(ALLOW_BALLPARK_SETTINGS_KEY, False)
         self.crs_menu = None
-        self.crs_menu_action = None
-        self.menu_button = None
+        self.plugin_help_menu = None
+        self.plugin_help_action = None
+        self.SPT = None
         
     def initGui(self):
         icon = QIcon(os.path.join(self.plugin_dir,"icon.png"))
-        tooltip=f"・*.ﾟ☆ <b>CRS Magic</b> ☆ﾟ.*・\nПідібрати СК для вибраних шарів"
+        tooltip = self.main_action_tooltip()
+        self.crs_menu = QMenu(self.iface.mainWindow())
         
-        action = QAction(icon, tooltip, self.iface.mainWindow())
+        action = QAction(icon, 'CRS Magic finder', self.iface.mainWindow())
+        action.setToolTip(tooltip)
         action.triggered.connect(self.Run)
         action.setEnabled(True)
         action.setCheckable(True)
-        self.iface.addToolBarIcon(action)
+        action.setMenu(self.crs_menu)
+        self.SPT = uaSPT(self.iface, action, [action])
         self.actions.append(action)
         self.action_reference=action
-        self.add_crs_menu_button()
+        self.register_plugin_help_action(icon)
+        self.rebuild_crs_menu()
         
     def unload(self):
-        for action in self.actions:
-            self.iface.removeToolBarIcon(action)
-        if self.menu_button:
-            self.menu_button.deleteLater()
+        if self.plugin_help_menu is not None and self.plugin_help_action is not None:
+            self.plugin_help_menu.removeAction(self.plugin_help_action)
+        if self.plugin_help_action is not None:
+            self.plugin_help_action.deleteLater()
+        self.plugin_help_menu = None
+        self.plugin_help_action = None
+        if self.SPT is not None:
+            self.SPT.unload()
+        self.SPT = None
+
+    def register_plugin_help_action(self, icon):
+        self.plugin_help_menu = self.iface.pluginHelpMenu()
+        if self.plugin_help_menu is None:
+            return
+
+        self.plugin_help_action = QAction(
+            icon,
+            'CRS Magic finder',
+            self.iface.mainWindow(),
+        )
+        self.plugin_help_action.setToolTip(
+            'Відкрити інструкцію з використання плагіна'
+        )
+        self.plugin_help_action.triggered.connect(self.open_help)
+        self.plugin_help_menu.addAction(self.plugin_help_action)
 
     def load_crs_sets(self):
-        value = self.settings.value(CRS_SETS_SETTINGS_KEY, '{}')
+        file_path = self.crs_sets_library_path()
+        if not os.path.isfile(file_path):
+            return {}, {}, 0
         try:
-            raw_sets = json.loads(str(value))
-        except Exception:
-            raw_sets = {}
+            with open(file_path, 'r', encoding='utf-8-sig') as library_file:
+                data = json.load(library_file)
+            crs_sets, crs_set_metadata, _ = crs_sets_bundle_from_json_data(data)
+            initial_version = int(data.get('initial_crs_sets_version', 0))
+        except Exception as error:
+            QgsMessageLog.logMessage(
+                f'Не вдалося прочитати {file_path}: {error}',
+                'CRS Magic finder',
+                Qgis.MessageLevel.Warning,
+            )
+            return {}, {}, 0
+        return crs_sets, crs_set_metadata, initial_version
 
-        if not isinstance(raw_sets, dict):
-            return {}
-
-        crs_sets = {}
-        for name, codes in raw_sets.items():
-            if isinstance(codes, list):
-                parsed_codes = parse_crs_codes('\n'.join([str(code) for code in codes]))
-            else:
-                parsed_codes = parse_crs_codes(codes)
-
-            if str(name).strip() and parsed_codes:
-                crs_sets[str(name).strip()] = parsed_codes
-
-        return crs_sets
+    def crs_sets_library_path(self):
+        return os.path.join(
+            QgsApplication.qgisSettingsDirPath(),
+            CRS_SETS_LIBRARY_DIRECTORY,
+            CRS_SETS_LIBRARY_FILE,
+        )
 
     def save_crs_sets(self):
-        self.settings.setValue(CRS_SETS_SETTINGS_KEY, json.dumps(self.crs_sets, ensure_ascii=False))
+        file_path = self.crs_sets_library_path()
+        os.makedirs(os.path.dirname(file_path), exist_ok=True)
+        data = crs_sets_to_json_data(self.crs_sets, self.crs_set_metadata)
+        data['initial_crs_sets_version'] = self.initial_crs_sets_version
+        temporary_path = f'{file_path}.tmp'
+        with open(temporary_path, 'w', encoding='utf-8') as library_file:
+            json.dump(data, library_file, ensure_ascii=False, indent=2)
+            library_file.write('\n')
+        os.replace(temporary_path, file_path)
+
+    def install_initial_crs_sets(self):
+        if self.initial_crs_sets_version >= INITIAL_CRS_SETS_VERSION:
+            return
+
+        initial_directory = os.path.realpath(
+            os.path.join(self.plugin_dir, 'initial_crs_sets')
+        )
+        plugin_directory = os.path.realpath(self.plugin_dir)
+        try:
+            is_inside_plugin = (
+                os.path.commonpath([initial_directory, plugin_directory])
+                == plugin_directory
+            )
+        except ValueError:
+            is_inside_plugin = False
+        if not is_inside_plugin or not os.path.isdir(initial_directory):
+            return
+
+        errors = []
+        for file_name in sorted(os.listdir(initial_directory)):
+            if not file_name.lower().endswith('.json'):
+                continue
+            file_path = os.path.join(initial_directory, file_name)
+            try:
+                with open(file_path, 'r', encoding='utf-8-sig') as source_file:
+                    data = json.load(source_file)
+                initial_sets, initial_metadata, _ = (
+                    crs_sets_bundle_from_json_data(data)
+                )
+            except Exception as error:
+                errors.append(f'{file_name}: {error}')
+                continue
+
+            for name, codes in initial_sets.items():
+                if name in self.crs_sets:
+                    continue
+                self.crs_sets[name] = codes
+                if name in initial_metadata:
+                    self.crs_set_metadata[name] = initial_metadata[name]
+
+        self.initial_crs_sets_version = INITIAL_CRS_SETS_VERSION
+        try:
+            self.save_crs_sets()
+        except OSError as error:
+            QgsMessageLog.logMessage(
+                f'Не вдалося зберегти початкові набори СК: {error}',
+                'CRS Magic finder',
+                Qgis.MessageLevel.Warning,
+            )
+
+        if errors:
+            QgsMessageLog.logMessage(
+                '\n'.join(errors),
+                'CRS Magic finder',
+                Qgis.MessageLevel.Warning,
+            )
 
     def load_active_crs_set(self):
+        if not self.settings.contains(ACTIVE_CRS_SET_SETTINGS_KEY):
+            active_set = (
+                DEFAULT_ACTIVE_CRS_SET
+                if DEFAULT_ACTIVE_CRS_SET in self.crs_sets
+                else ALL_CRS_SET_KEY
+            )
+            self.settings.setValue(ACTIVE_CRS_SET_SETTINGS_KEY, active_set)
+            self.settings.sync()
+            return active_set
+
         active_set = self.settings.value(ACTIVE_CRS_SET_SETTINGS_KEY, ALL_CRS_SET_KEY)
         active_set = str(active_set or ALL_CRS_SET_KEY)
         if active_set != ALL_CRS_SET_KEY and active_set not in self.crs_sets:
@@ -535,9 +240,22 @@ class CRS_Magic:
     def save_active_crs_set(self):
         self.settings.setValue(ACTIVE_CRS_SET_SETTINGS_KEY, self.active_crs_set)
 
+    def load_bool_setting(self, key, default=False):
+        value = self.settings.value(key, default)
+        if isinstance(value, bool):
+            return value
+        return str(value).strip().lower() in ('1', 'true', 'yes', 'on')
+
+    def set_bool_setting(self, attribute, key, enabled):
+        setattr(self, attribute, bool(enabled))
+        self.settings.setValue(key, bool(enabled))
+        self.settings.sync()
+        if self.action_reference:
+            self.action_reference.setToolTip(self.main_action_tooltip())
+
     def active_crs_set_label(self):
         if self.active_crs_set == ALL_CRS_SET_KEY:
-            return 'Всі СК'
+            return 'Усі СК'
         codes = self.crs_sets.get(self.active_crs_set, [])
         return f'{self.active_crs_set} ({len(codes)} СК)'
 
@@ -554,27 +272,15 @@ class CRS_Magic:
 
         return codes
 
-    def add_crs_menu_button(self):
-        self.crs_menu = QMenu(self.iface.mainWindow())
-        self.rebuild_crs_menu()
-
-        if hasattr(self.iface, 'addToolBarWidget'):
-            self.menu_button = QToolButton(self.iface.mainWindow())
-            self.menu_button.setText('▾')
-            self.menu_button.setToolTip(f'Набір СК: {self.active_crs_set_label()}')
-            self.menu_button.setPopupMode(QToolButton.InstantPopup)
-            self.menu_button.setAutoRaise(True)
-            self.menu_button.setFixedWidth(22)
-            self.menu_button.setMenu(self.crs_menu)
-            self.crs_menu_action = self.iface.addToolBarWidget(self.menu_button)
-            if self.crs_menu_action:
-                self.actions.append(self.crs_menu_action)
-        else:
-            self.crs_menu_action = QAction('▾', self.iface.mainWindow())
-            self.crs_menu_action.setToolTip(f'Набір СК: {self.active_crs_set_label()}')
-            self.crs_menu_action.setMenu(self.crs_menu)
-            self.iface.addToolBarIcon(self.crs_menu_action)
-            self.actions.append(self.crs_menu_action)
+    def main_action_tooltip(self):
+        search_mode = 'груповий' if self.group_search else 'окремий для кожного шару'
+        crs_mode = 'швидкий' if self.fast_mode else 'через PROJ-рядок'
+        return (
+            "<b>CRS Magic finder</b> ・*.ﾟ☆\n"
+            f"Підібрати СК для вибраних векторних і растрових шарів\n"
+            f"Набір СК: {self.active_crs_set_label()}\n"
+            f"Пошук: {search_mode}\nРежим СК: {crs_mode}"
+        )
 
     def rebuild_crs_menu(self):
         if not self.crs_menu:
@@ -582,7 +288,16 @@ class CRS_Magic:
 
         self.crs_menu.clear()
 
-        all_action = self.crs_menu.addAction('Всі СК')
+        if self.action_reference is not None:
+            main_action = self.crs_menu.addAction(
+                self.action_reference.icon(),
+                self.action_reference.text(),
+            )
+            main_action.setToolTip(self.main_action_tooltip())
+            main_action.triggered.connect(self.Run)
+            self.crs_menu.addSeparator()
+
+        all_action = self.crs_menu.addAction('Усі СК')
         all_action.setCheckable(True)
         all_action.setChecked(self.active_crs_set == ALL_CRS_SET_KEY)
         all_action.triggered.connect(lambda checked=False: self.set_active_crs_set(ALL_CRS_SET_KEY))
@@ -597,13 +312,112 @@ class CRS_Magic:
                 action.triggered.connect(lambda checked=False, name=set_name: self.set_active_crs_set(name))
 
         self.crs_menu.addSeparator()
-        settings_action = self.crs_menu.addAction('Налаштування...')
+        search_menu = self.crs_menu.addMenu('Режими пошуку')
+
+        fast_mode_action = search_menu.addAction(
+            'Швидкий режим (без PROJ-рядків)'
+        )
+        fast_mode_action.setCheckable(True)
+        fast_mode_action.setChecked(self.fast_mode)
+        fast_mode_action.setToolTip(
+            'Використовує визначення СК безпосередньо з бази QGIS. '
+            'Може пришвидшити підготовку, але на старих версіях QGIS '
+            'інколи дає некоректні результати.'
+        )
+        fast_mode_action.toggled.connect(
+            lambda enabled: self.set_bool_setting(
+                'fast_mode',
+                FAST_MODE_SETTINGS_KEY,
+                enabled,
+            )
+        )
+
+        group_search_action = search_menu.addAction('Груповий підбір для кількох шарів')
+        group_search_action.setCheckable(True)
+        group_search_action.setChecked(self.group_search)
+        group_search_action.setToolTip(
+            'Послідовно групувати шари, екстенти об’єктів яких перетинаються '
+            'з найбільшим екстентом серед ще не згрупованих шарів.'
+        )
+        group_search_action.toggled.connect(
+            lambda enabled: self.set_bool_setting(
+                'group_search',
+                GROUP_SEARCH_SETTINGS_KEY,
+                enabled,
+            )
+        )
+
+        fallback_menu = self.crs_menu.addMenu('Запасні й приблизні перетворення')
+
+        disable_handler_action = fallback_menu.addAction(
+            'Виявляти запасні перетворення (Fallback)'
+        )
+        disable_handler_action.setCheckable(True)
+        disable_handler_action.setChecked(self.disable_fallback_handler)
+        disable_handler_action.setToolTip(
+            'Вимикає стандартний обробник QGIS, щоб плагін міг виявляти '
+            'й позначати запасні операції. Самі запасні перетворення цей параметр не забороняє.'
+        )
+        disable_handler_action.toggled.connect(
+            lambda enabled: self.set_bool_setting(
+                'disable_fallback_handler',
+                DISABLE_FALLBACK_HANDLER_SETTINGS_KEY,
+                enabled,
+            )
+        )
+
+        allow_fallback_action = fallback_menu.addAction('Дозволяти запасні перетворення (Fallback)')
+        allow_fallback_action.setCheckable(True)
+        allow_fallback_action.setChecked(self.allow_fallback)
+        allow_fallback_action.setToolTip(
+            'Дозволяє PROJ використати запасну операцію, якщо рекомендована недоступна. '
+            'Результат може бути менш точним.'
+        )
+        allow_fallback_action.toggled.connect(
+            lambda enabled: self.set_bool_setting(
+                'allow_fallback',
+                ALLOW_FALLBACK_SETTINGS_KEY,
+                enabled,
+            )
+        )
+
+        allow_ballpark_action = fallback_menu.addAction('Дозволяти приблизні перетворення (Ballpark)')
+        allow_ballpark_action.setCheckable(True)
+        allow_ballpark_action.setChecked(self.allow_ballpark)
+        allow_ballpark_action.setToolTip(
+            'Дозволяє приблизні перетворення без гарантованої геодезичної точності. '
+            'Має пріоритет над забороною запасних перетворень.'
+        )
+        allow_ballpark_action.toggled.connect(
+            lambda enabled: self.set_bool_setting(
+                'allow_ballpark',
+                ALLOW_BALLPARK_SETTINGS_KEY,
+                enabled,
+            )
+        )
+
+        self.crs_menu.addSeparator()
+        settings_action = self.crs_menu.addAction('Налаштування…')
         settings_action.triggered.connect(self.open_crs_sets_settings)
 
-        if self.menu_button:
-            self.menu_button.setToolTip(f'Набір СК: {self.active_crs_set_label()}')
-        if self.crs_menu_action:
-            self.crs_menu_action.setToolTip(f'Набір СК: {self.active_crs_set_label()}')
+        self.crs_menu.addSeparator()
+        help_action = self.crs_menu.addAction('Довідка')
+        help_action.setToolTip('Відкрити інструкцію з використання плагіна')
+        help_action.triggered.connect(self.open_help)
+
+        if self.action_reference:
+            self.action_reference.setToolTip(self.main_action_tooltip())
+
+    def open_help(self):
+        help_path = os.path.join(self.plugin_dir, 'help', 'index.html')
+        if not os.path.isfile(help_path):
+            self.iface.messageBar().pushMessage(
+                '[CRS Magic finder] Файл довідки не знайдено.',
+                Qgis.MessageLevel.Warning,
+                5,
+            )
+            return
+        QDesktopServices.openUrl(QUrl.fromLocalFile(help_path))
 
     def set_active_crs_set(self, set_name):
         if set_name != ALL_CRS_SET_KEY and set_name not in self.crs_sets:
@@ -614,7 +428,17 @@ class CRS_Magic:
         self.rebuild_crs_menu()
 
     def open_crs_sets_settings(self):
-        dialog = CRSSetSettingsDialog(self.crs_sets, self.iface.mainWindow())
+        dialog = CRSSetSettingsDialog(
+            self.crs_sets,
+            parent=self.iface.mainWindow(),
+            fast_mode=self.fast_mode,
+            group_search=self.group_search,
+            disable_fallback_handler=self.disable_fallback_handler,
+            allow_fallback=self.allow_fallback,
+            allow_ballpark=self.allow_ballpark,
+            source_map_canvas=self.iface.mapCanvas(),
+            crs_set_metadata=self.crs_set_metadata,
+        )
         icon = QIcon(os.path.join(self.plugin_dir, "icon.png"))
         dialog.setWindowIcon(icon)
 
@@ -622,7 +446,33 @@ class CRS_Magic:
             return
 
         self.crs_sets = dialog.result_sets()
+        self.crs_set_metadata = dialog.result_metadata()
         self.save_crs_sets()
+        self.set_bool_setting(
+            'fast_mode',
+            FAST_MODE_SETTINGS_KEY,
+            dialog.fast_mode(),
+        )
+        self.set_bool_setting(
+            'group_search',
+            GROUP_SEARCH_SETTINGS_KEY,
+            dialog.group_search(),
+        )
+        self.set_bool_setting(
+            'disable_fallback_handler',
+            DISABLE_FALLBACK_HANDLER_SETTINGS_KEY,
+            dialog.disable_fallback_handler(),
+        )
+        self.set_bool_setting(
+            'allow_fallback',
+            ALLOW_FALLBACK_SETTINGS_KEY,
+            dialog.allow_fallback(),
+        )
+        self.set_bool_setting(
+            'allow_ballpark',
+            ALLOW_BALLPARK_SETTINGS_KEY,
+            dialog.allow_ballpark(),
+        )
 
         if self.active_crs_set != ALL_CRS_SET_KEY and self.active_crs_set not in self.crs_sets:
             self.active_crs_set = ALL_CRS_SET_KEY
@@ -633,11 +483,27 @@ class CRS_Magic:
     def clearMBar(self):        
         mbar=self.iface.messageBar()
         for message in mbar.items():
-            if message.text().startswith("[CRS Magic]"):
+            if message.text().startswith("[CRS Magic finder]"):
                 message.dismiss()
+
+    def configure_transform_fallback(self, transformation):
+        transformation.disableFallbackOperationHandler(self.disable_fallback_handler)
+        transformation.setAllowFallbackTransforms(self.allow_fallback)
+        transformation.setBallparkTransformsAreAppropriate(self.allow_ballpark)
     
     
     def get_CRS_dict(self,click_point):
+        geographic_warnings = []
+
+        def show_geographic_warning(message):
+            if message not in geographic_warnings:
+                geographic_warnings.append(message)
+            message_bar.pushMessage(
+                f'[CRS Magic finder] {message}',
+                Qgis.MessageLevel.Info,
+                8,
+            )
+
         def status_changed(status):
             if status==3:
                 fk_b_s=r'<span style="color:black">'
@@ -649,37 +515,58 @@ class CRS_Magic:
                 #print("Завершено!")
                 #print('Звіт:')
                 #print(task.message)
-                result_message=f'[CRS Magic] Перевірте коректність підбору СК по фотоплану.\r\n\r\n'
+                result_message=f'[CRS Magic finder] Перевірте результат підбору СК за фотопланом.\r\n\r\n'
                 number=1
+                automatic_changes = []
                 
                 for layer in self.selected_layers:
                     result_message=result_message+f'\r\n{number}. '
                     number=number+1
                     layer_id=layer.id()
-                    if layer_id in task.total_result and task.total_result[layer_id]['Checked']:
-                        if 'PossibleCRS' in task.total_result[layer_id]:
+                    layer_result = task.result_for_layer(layer_id)
+                    if layer_result and layer_result['Checked']:
+                        if 'PossibleCRS' in layer_result:
                             if self.results_dialog and self.results_dialog.has_manual_selection(layer_id):
                                 crs=self.results_dialog.manual_selection_text(layer_id)
-                                result_message=result_message+f"{fk_b_s}Шар '{layer.name()}':\r\n СК змінено вручну на {crs}.{fk_e}\r\n"
+                                result_message=result_message+f"{fk_b_s}Шар «{layer.name()}»:\r\n СК вручну змінено на {crs}.{fk_e}\r\n"
                             else:
-                                crs=task.total_result[layer_id]['PossibleCRS']
-                                other_crs=task.total_result[layer_id]['OtherPossibleCRS']
-                                found_crs=task.total_result[layer_id]['FoundCRS']
+                                crs=layer_result['PossibleCRS']
+                                other_crs=layer_result['OtherPossibleCRS']
+                                found_crs=layer_result['FoundCRS']
+                                old_crs = QgsCoordinateReferenceSystem(layer.crs())
                                 layer.setCrs(found_crs)
-                                result_message=result_message+f"{fk_b_s}Шар '{layer.name()}':\r\n СК змінено на {crs}.  {other_crs}{fk_e}\r\n"
+                                if old_crs != found_crs:
+                                    automatic_changes.append((layer, old_crs, found_crs))
+                                result_message=result_message+f"{fk_b_s}Шар «{layer.name()}»:\r\n СК змінено на {crs}. {other_crs}{fk_e}\r\n"
                         else:
-                            result_message=result_message+f"{fk_r_s}Шар '{layer.name()}': помилка підбору СК - {task.total_result[layer_id]['Error']}{fk_e}\r\n"
+                            result_message=result_message+f"{fk_r_s}Шар «{layer.name()}»: помилка підбору СК — {layer_result['Error']}{fk_e}\r\n"
                             
-                    elif layer.type() != QgsMapLayerType.VectorLayer:
-                        result_message=result_message+f"{fk_r_s}Шар '{layer.name()}': не було перевірено, так як він не векторний{fk_e}\r\n"
+                    elif layer.type() not in (QgsMapLayerType.VectorLayer, QgsMapLayerType.RasterLayer):
+                        result_message=result_message+f"{fk_r_s}Шар «{layer.name()}» не перевірено, оскільки він не є векторним або растровим.{fk_e}\r\n"
                         
-                    elif layer.featureCount() == 0:
-                        result_message=result_message+f"{fk_r_s}Шар '{layer.name()}': не було перевірено, так як в ньому відсутні об'єкти{fk_e}\r\n"
-                                
-                
-                canvas.refreshAllLayers()
+                if self.results_dialog and automatic_changes:
+                    self.results_dialog.record_external_changes(automatic_changes)
+
+                for changed_layer, old_crs, new_crs in automatic_changes:
+                    changed_layer.triggerRepaint(True)
+                if automatic_changes:
+                    canvas.refresh()
                 self.clearMBar()
-                message_bar.pushMessage("[CRS Magic] Підбір СК завершено. Результати доступні у таблиці.", Qgis.MessageLevel.Success, 5)
+                message_bar.pushMessage("[CRS Magic finder] Підбір СК завершено. Результати доступні в таблиці.", Qgis.MessageLevel.Success, 5)
+                if geographic_warnings:
+                    message_bar.pushMessage(
+                        '[CRS Magic finder] ' + ' '.join(geographic_warnings),
+                        Qgis.MessageLevel.Info,
+                        10,
+                    )
+                if task.fallback_crs_qty:
+                    message_bar.pushMessage(
+                        '[CRS Magic finder] Під час підбору використано запасні '
+                        f'перетворення (Fallback): {task.fallback_crs_qty}. '
+                        'Перевірте результат за надійною картографічною підкладкою.',
+                        Qgis.MessageLevel.Warning,
+                        10,
+                    )
                 print(result_message)
                 # if len(self.selected_layers)>0:
                     # custom_message_box = CustomMessageBox('Готово!', result_message)
@@ -698,45 +585,81 @@ class CRS_Magic:
                 # print(task.last_action)
                 if task.isCanceled():
                     if self.results_dialog:
-                        self.results_dialog.mark_failed('Підбір СК відмінено користувачем')
-                    print("Відмінено користувачем!")
+                        self.results_dialog.mark_failed('Підбір СК скасовано користувачем')
+                    print("Скасовано користувачем")
                 else:
                     if task.getFailure():                            
                         failure=task.getFailure()
                     else:
-                        failure="Помилка, спробуйте ще раз!"
+                        failure="Сталася помилка. Повторіть спробу."
                     if self.results_dialog:
                         self.results_dialog.mark_failed(failure)
-                    print(f"[CRS Magic] {failure}")
+                    print(f"[CRS Magic finder] {failure}")
                     print(task.message)
-                    message_bar.pushMessage(f"[CRS Magic] {failure}", Qgis.MessageLevel.Warning, 5)                        
+                    message_bar.pushMessage(f"[CRS Magic finder] {failure}", Qgis.MessageLevel.Warning, 5)                        
                 
         self.clearMBar()
         message_bar = self.iface.messageBar()
         #print(f'Точка кліку до входження в задачу: {click_point.toString(4)}')
         project = QgsProject.instance()
+        transform_context = QgsCoordinateTransformContext(project.transformContext())
         canvas = self.iface.mapCanvas()
         canvas_crs = canvas.mapSettings().destinationCrs()        
         work_crs = QgsCoordinateReferenceSystem('EPSG:3857')
         
         transformation = QgsCoordinateTransform(canvas_crs, work_crs, project)
-        transformation.disableFallbackOperationHandler(True)
+        self.configure_transform_fallback(transformation)
         tr_click_point=transformation.transform(click_point)
         
         crs_codes = self.active_crs_codes()
         crs_set_name = self.active_crs_set_label()
+        layer_inputs = []
+        for layer in self.layers:
+            layer_input = {
+                'id': layer.id(),
+                'name': layer.name(),
+                'type': layer.type(),
+                'feature_source': None,
+                'extent': None,
+            }
+            if layer.type() == QgsMapLayerType.VectorLayer:
+                try:
+                    layer_input['feature_source'] = QgsVectorLayerFeatureSource(layer)
+                except Exception:
+                    layer_input['feature_source'] = None
+            if layer.type() == QgsMapLayerType.RasterLayer:
+                try:
+                    layer_input['extent'] = QgsRectangle(layer.extent())
+                except Exception:
+                    layer_input['extent'] = None
+            layer_inputs.append(layer_input)
 
-        message_bar.pushMessage(f'[CRS Magic] Зачекайте будь ласка, йде підбір СК... Набір: {crs_set_name}', Qgis.MessageLevel.Success,0)
+        message_bar.pushMessage(f'[CRS Magic finder] Триває підбір СК. Зачекайте, будь ласка. Набір: {crs_set_name}', Qgis.MessageLevel.Success,0)
         
         if self.results_dialog:
             self.results_dialog.close()
         self.results_dialog = CRSResultsDialog(self.layers, self.iface, self.iface.mainWindow())
         self.results_dialog.show()
 
-        task = findCrs("Пошук можливих систем координат", self.layers, tr_click_point, work_crs, project, crs_codes, crs_set_name)
+        task = findCrs(
+            "Пошук можливих систем координат",
+            layer_inputs,
+            tr_click_point,
+            work_crs,
+            crs_codes,
+            crs_set_name,
+            self.fast_mode,
+            self.group_search,
+            self.disable_fallback_handler,
+            self.allow_fallback,
+            self.allow_ballpark,
+            transform_context,
+        )
         self.results_dialog.set_task(task)
+        task.groupsPrepared.connect(self.results_dialog.set_search_units)
         task.crsChecked.connect(self.results_dialog.add_result)
         task.statsChanged.connect(self.results_dialog.update_stats)
+        task.geographicCrsSkipped.connect(show_geographic_warning)
         
         task.statusChanged.connect(status_changed)
         task.setDependentLayers(self.layers)
@@ -765,16 +688,18 @@ class CRS_Magic:
         selected_layers = self.iface.layerTreeView().selectedLayersRecursive()
         
         if len(selected_layers)<1:
-            message_bar.pushMessage("[CRS Magic] Спочатку виділіть векторні шари в панелі шарів!", Qgis.MessageLevel.Warning, 5)
+            message_bar.pushMessage("[CRS Magic finder] Спочатку виділіть векторні або растрові шари в панелі шарів.", Qgis.MessageLevel.Warning, 5)
             self.action_reference.setChecked(False)
             return
         
         for layer in selected_layers:
-            if layer.type() == QgsMapLayerType.VectorLayer and layer.featureCount() != 0:
+            if layer.type() == QgsMapLayerType.VectorLayer and layer.isValid():
+                layers.append(layer)
+            elif layer.type() == QgsMapLayerType.RasterLayer and layer.isValid():
                 layers.append(layer)
         
         if len(layers)<1:
-            message_bar.pushMessage("[CRS Magic] Жоден з вибраних шарів не векторний або в не містить об'єктів для аналізу. Будь ласка спочатку виберіть векторні шари", Qgis.MessageLevel.Warning, 5)
+            message_bar.pushMessage("[CRS Magic finder] Серед вибраних немає придатних векторних або растрових шарів для аналізу.", Qgis.MessageLevel.Warning, 5)
             self.action_reference.setChecked(False)
             return
         
@@ -785,16 +710,16 @@ class CRS_Magic:
         
         layers_warning=''
         if not all(element in layers for element in selected_layers):
-            layers_warning=".Зверніть увагу: деякі з вибраних шарів не векторні або в них відсутні об'єкти!" 
+            layers_warning=" Частину вибраних шарів пропущено: вони мають непідтримуваний тип, є некоректними або порожніми."
         
         self.activated=True
         self.action_reference.setChecked(True)
         crs_set_name = self.active_crs_set_label()
         
         if len(layers)==1:
-            message_bar.pushMessage(f"[CRS Magic] Клікніть на карті приблизне можливе місцезнаходження об'єктів шару '{layers[0].name()}'{layers_warning}. Набір СК: {crs_set_name}", Qgis.MessageLevel.Info, 0)
+            message_bar.pushMessage(f"[CRS Magic finder] Клацніть на карті, щоб указати орієнтовне місце розташування об’єктів шару «{layers[0].name()}».{layers_warning} Набір СК: {crs_set_name}", Qgis.MessageLevel.Info, 0)
         else:
-            message_bar.pushMessage(f"[CRS Magic] Клікніть на карті приблизне можливе місцезнаходження об'єктів вибраних шарів({len(selected_layers)}шт.) {layers_warning}. Набір СК: {crs_set_name}", Qgis.MessageLevel.Info, 0)
+            message_bar.pushMessage(f"[CRS Magic finder] Клацніть на карті, щоб указати орієнтовне місце розташування об’єктів вибраних шарів. Вибрано шарів: {len(selected_layers)}.{layers_warning} Набір СК: {crs_set_name}", Qgis.MessageLevel.Info, 0)
         
         self.layers=layers
         self.selected_layers=selected_layers

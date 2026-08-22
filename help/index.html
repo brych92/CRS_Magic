@@ -1,0 +1,497 @@
+<!DOCTYPE html>
+<html lang="uk">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>CRS Magic finder | Довідка</title>
+  <link rel="shortcut icon" href="../icon.png" type="image/png">
+  <link rel="icon" href="../icon.png" type="image/png">
+  <style>
+    :root {
+      --bg: #f5f8fc;
+      --fg: #223140;
+      --muted: #55657a;
+      --accent: #0066cc;
+      --accent-soft: #eaf4ff;
+      --border: #bdd5ea;
+      --card-bg: #ffffff;
+      --warning-bg: #fff3cd;
+      --warning-border: #ffe08a;
+      --success-bg: #eef9f1;
+      --success-border: #b9dfc2;
+      --shadow: 0 2px 18px rgba(110, 137, 170, .09);
+      --radius: 14px;
+      --max-width: 980px;
+    }
+
+    * { box-sizing: border-box; }
+
+    html { scroll-behavior: smooth; }
+
+    body {
+      margin: 0;
+      font-family: "Segoe UI", Arial, sans-serif;
+      background: var(--bg);
+      color: var(--fg);
+      line-height: 1.55;
+    }
+
+    a { color: var(--accent); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+
+    .wrapper {
+      max-width: var(--max-width);
+      margin: 44px auto 56px;
+      padding: 0 28px;
+    }
+
+    header, footer { text-align: center; }
+
+    header img {
+      width: 84px;
+      height: 84px;
+      object-fit: contain;
+      margin-bottom: 10px;
+    }
+
+    h1 { margin: 0 0 5px; font-size: 2rem; }
+    h2 { margin: 0 0 .7em; font-size: 1.38rem; }
+    h3 { margin: 1.3em 0 .45em; font-size: 1.08rem; }
+    p { margin: .65em 0; }
+    ul, ol { padding-left: 1.5rem; }
+    li + li { margin-top: .38em; }
+
+    .subtitle { margin: 0; color: var(--muted); }
+
+    .card {
+      background: var(--card-bg);
+      border: 1.5px solid var(--border);
+      border-radius: var(--radius);
+      padding: 25px 28px;
+      box-shadow: var(--shadow);
+      margin-top: 28px;
+    }
+
+    .quick-links {
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: center;
+      gap: 9px;
+      margin-top: 26px;
+    }
+
+    .quick-links a {
+      display: inline-block;
+      padding: 8px 13px;
+      background: var(--card-bg);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      font-weight: 600;
+    }
+
+    .steps {
+      list-style: none;
+      padding: 0;
+      counter-reset: help-step;
+    }
+
+    .steps li {
+      position: relative;
+      padding-left: 48px;
+      min-height: 38px;
+      counter-increment: help-step;
+    }
+
+    .steps li::before {
+      content: counter(help-step);
+      position: absolute;
+      left: 0;
+      top: 1px;
+      width: 31px;
+      height: 31px;
+      display: grid;
+      place-items: center;
+      color: #fff;
+      background: var(--accent);
+      border-radius: 50%;
+      font-weight: 700;
+    }
+
+    .note, .warning {
+      border-radius: 10px;
+      padding: 15px 18px;
+      margin-top: 18px;
+      font-size: .96rem;
+    }
+
+    .note {
+      background: var(--success-bg);
+      border: 1.5px solid var(--success-border);
+    }
+
+    .warning {
+      background: var(--warning-bg);
+      border: 1.5px solid var(--warning-border);
+    }
+
+    figure { margin: 22px 0 5px; }
+
+    figure img {
+      display: block;
+      max-width: 100%;
+      height: auto;
+      margin: 0 auto;
+      border: 1px solid #aebdca;
+      border-radius: 8px;
+      background: #fff;
+      box-shadow: 0 5px 22px rgba(44, 67, 91, .12);
+    }
+
+    figcaption {
+      margin-top: 9px;
+      text-align: center;
+      color: var(--muted);
+      font-size: .88rem;
+    }
+
+    .term-grid {
+      display: grid;
+      grid-template-columns: minmax(135px, .7fr) 2.3fr;
+      gap: 0;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      overflow: hidden;
+    }
+
+    .term-grid div {
+      padding: 11px 13px;
+      border-bottom: 1px solid var(--border);
+    }
+
+    .term-grid div:nth-last-child(-n + 2) { border-bottom: 0; }
+    .term { font-weight: 700; background: var(--accent-soft); }
+
+    .table-wrap { overflow-x: auto; }
+
+    .data-table {
+      width: 100%;
+      border-collapse: collapse;
+      border: 1px solid var(--border);
+      font-size: .95rem;
+    }
+
+    .data-table th, .data-table td {
+      padding: 10px 12px;
+      border: 1px solid var(--border);
+      text-align: left;
+      vertical-align: top;
+    }
+
+    .data-table th { background: var(--accent-soft); }
+    .data-table td:nth-child(2) { text-align: center; white-space: nowrap; }
+
+    code {
+      padding: 1px 5px;
+      background: #edf2f7;
+      border-radius: 4px;
+      font-family: Consolas, monospace;
+    }
+
+    footer {
+      margin-top: 52px;
+      color: var(--muted);
+      font-size: .88rem;
+    }
+
+    @media (max-width: 700px) {
+      .wrapper { margin-top: 28px; padding: 0 15px; }
+      .card { padding: 20px 18px; }
+      .term-grid { grid-template-columns: 1fr; }
+      .term-grid div { border-bottom: 0; }
+      .term-grid div:not(.term) { border-bottom: 1px solid var(--border); }
+      .term-grid div:last-child { border-bottom: 0; }
+    }
+  </style>
+</head>
+
+<body>
+  <div class="wrapper">
+    <header>
+      <img src="../icon.png" alt="Логотип CRS Magic finder">
+      <h1>CRS Magic finder</h1>
+      <p class="subtitle">Підбір систем координат для векторних і растрових шарів у QGIS</p>
+    </header>
+
+    <nav class="quick-links" aria-label="Розділи довідки">
+      <a href="#start">Швидкий старт</a>
+      <a href="#results">Результати</a>
+      <a href="#settings">Налаштування</a>
+      <a href="#sets">Набори СК</a>
+      <a href="#problems">Типові проблеми</a>
+    </nav>
+
+    <main>
+      <section class="card">
+        <h2>Що робить плагін?</h2>
+        <p>
+          <strong>CRS Magic finder</strong> допомагає визначити ймовірну систему
+          координат (СК) для шару, якщо вона відсутня або призначена неправильно.
+          Плагін аналізує координати векторних об’єктів або екстент растра, перевіряє
+          вибраний набір СК і порівнює отримане розташування з точкою, яку ви вказали
+          на карті.
+        </p>
+        <ul>
+          <li>працює з коректними векторними та растровими шарами;</li>
+          <li>може перевіряти кожен шар окремо або групувати просторово пов’язані шари;</li>
+          <li>показує можливі СК, які розміщують дані в межах 200 км від точки кліку;</li>
+          <li>дозволяє призначити результат одному чи кільком шарам і локально скасувати дію.</li>
+        </ul>
+
+        <div class="warning">
+          <strong>Важливо.</strong> Плагін лише змінює СК, призначену шару. Він не
+          перепроєктовує файл і не змінює вихідні координати. Остаточний результат
+          завжди перевіряйте за надійною картографічною основою або контрольними точками.
+        </div>
+      </section>
+
+      <section class="card" id="start">
+        <h2>Швидкий старт</h2>
+        <ol class="steps">
+          <li>
+            <strong>Додайте картографічну основу.</strong> Вона допоможе вказати
+            очікуване реальне місце розташування даних і перевірити результат.
+          </li>
+          <li>
+            <strong>Виділіть шари або групи</strong> у панелі «Шари». Порожні,
+            некоректні та непідтримувані шари буде пропущено.
+          </li>
+          <li>
+            <strong>Запустіть CRS Magic finder.</strong> Основна кнопка доступна
+            в меню та на панелі UA SPT. Стрілка біля кнопки відкриває вибір набору
+            СК, режими пошуку, налаштування і цю довідку.
+          </li>
+          <li>
+            <strong>Клацніть на карті</strong> приблизно там, де мають бути
+            розташовані вибрані дані. Не потрібно влучати точно в об’єкт — важлива
+            правильна місцевість.
+          </li>
+          <li>
+            <strong>Дочекайтеся завершення.</strong> Можливі СК з’являються у таблиці
+            поступово. Після успішного завершення найближча знайдена СК автоматично
+            призначається кожному початково вибраному шару.
+          </li>
+          <li>
+            <strong>Перевірте накладання.</strong> Якщо найближчий варіант неправильний,
+            виберіть інший рядок і застосуйте його вручну.
+          </li>
+        </ol>
+
+        <div class="note">
+          Для швидшої першої перевірки виберіть набір <strong>Ukraine - UCS/CS63</strong>.
+          Пошук серед <strong>усіх СК</strong> QGIS доцільний, якщо походження даних
+          невідоме або потрібної СК немає в робочому наборі.
+        </div>
+      </section>
+
+      <section class="card" id="results">
+        <h2>Вікно результатів</h2>
+        <p>
+          Список <strong>«Шар або група»</strong> перемикає окремі таблиці результатів.
+          Вибір синхронізується з деревом шарів. Кнопка з лупою наближує карту до
+          поточного шару або групи, а кнопки зі стрілками скасовують і повторюють
+          призначення СК, зроблені поки це вікно відкрите.
+        </p>
+
+        <figure>
+          <img src="images/results-window.png" alt="Вікно результатів CRS Magic finder">
+          <figcaption>Вікно результатів підбору СК.</figcaption>
+        </figure>
+
+        <h3>Як читати таблицю</h3>
+        <div class="term-grid">
+          <div class="term">СК</div>
+          <div>Код і назва можливої системи координат.</div>
+          <div class="term">Відстань, м</div>
+          <div>Відстань між перетвореним центром даних і точкою кліку. Менше значення зазвичай означає кращу можливу СК, але не гарантує правильність.</div>
+          <div class="term">Примітка</div>
+          <div>Порожньо для звичайної операції, <strong>Fallback</strong> для запасного перетворення або <strong>Ballpark</strong> для приблизного.</div>
+        </div>
+
+        <h3>Ручне застосування</h3>
+        <p>
+          Виділіть потрібний рядок, потім у панелі «Шари» виділіть цільові шари й
+          натисніть <strong>«Застосувати вибрану СК до виділених шарів»</strong>.
+          Зверніть увагу: кнопка працює з шарами, виділеними в панелі саме в цей
+          момент; це можуть бути не ті шари, з яких починався пошук. Подвійне клацання
+          рядка виконує ту саму дію.
+        </p>
+      </section>
+
+      <section class="card" id="settings">
+        <h2>Налаштування пошуку</h2>
+        <p>
+          Усі параметри доступні у вікні <strong>«Налаштування…»</strong>, а основні
+          перемикачі також дублюються в меню кнопки плагіна.
+        </p>
+
+        <figure>
+          <img src="images/settings-window.png" alt="Вікно налаштувань CRS Magic finder">
+          <figcaption>Керування наборами СК і режимами пошуку.</figcaption>
+        </figure>
+
+        <h3>Режими</h3>
+        <ul>
+          <li>
+            <strong>Швидкий режим (без PROJ-рядків)</strong> — використовує
+            визначення СК безпосередньо з бази QGIS. Може пришвидшити підготовку великого
+            набору; на старих версіях QGIS інколи дає некоректні результати.
+          </li>
+          <li>
+            <strong>Груповий підбір для кількох шарів</strong> — об’єднує шари за
+            перетином обчислених екстентів і перевіряє їх спільно. Вимкніть, якщо кожен
+            шар потрібно оцінювати незалежно.
+          </li>
+          <li>
+            <strong>Виявляти запасні перетворення (Fallback)</strong> — дає плагіну
+            змогу виявляти й позначати запасні операції. Самі запасні перетворення цей
+            параметр не забороняє.
+          </li>
+          <li>
+            <strong>Дозволяти запасні перетворення (Fallback)</strong> — якщо рекомендована
+            операція недоступна, дозволяє PROJ використати іншу придатну операцію.
+            Такий результат позначається в таблиці й може бути менш точним.
+          </li>
+          <li>
+            <strong>Дозволяти приблизні перетворення (Ballpark)</strong> — допускає
+            орієнтовні перетворення без гарантованої геодезичної точності. Використовуйте
+            лише для пошуку можливих СК і ретельно перевіряйте результат. Цей дозвіл має
+            пріоритет над забороною запасних перетворень.
+          </li>
+        </ul>
+      </section>
+
+      <section class="card" id="sets">
+        <h2>Набори систем координат</h2>
+        <p>
+          Набір обмежує кількість СК, які перевіряє плагін. Активний набір вибирається
+          в меню кнопки й зберігається між сеансами QGIS. Пункт <strong>«Усі СК»</strong>
+          не є окремим набором: він запускає перевірку усіх коректних СК з бази
+          QGIS і тому зазвичай працює найдовше. Під час першого запуску плагіна
+          автоматично активується набір <strong>Ukraine - UCS/CS63</strong>;
+          надалі плагін запам’ятовує вибір користувача.
+        </p>
+
+        <h3>Вбудовані набори</h3>
+        <p>Разом із плагіном постачається сім початкових наборів:</p>
+        <div class="table-wrap">
+          <table class="data-table">
+            <thead>
+              <tr>
+                <th>Назва в меню</th>
+                <th>СК</th>
+                <th>Що містить</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><strong>Ukraine - UCS/CS63</strong></td>
+                <td>65</td>
+                <td>Українські СК UCS-2000 і CS63, поширені історичні системи та загальні WGS 84 / Web Mercator.</td>
+              </tr>
+              <tr>
+                <td><strong>World - common</strong></td>
+                <td>7</td>
+                <td>Поширені глобальні географічні, веб-, рівновеликі та рівновіддалені проєкції.</td>
+              </tr>
+              <tr>
+                <td><strong>Europe - ETRS89/UTM</strong></td>
+                <td>17</td>
+                <td>ETRS89, загальноєвропейські LAEA/LCC та зони ETRS89 / UTM 28N–38N.</td>
+              </tr>
+              <tr>
+                <td><strong>Africa - WGS84/UTM</strong></td>
+                <td>28</td>
+                <td>WGS 84 / UTM 28–39 для обох півкуль і континентальні проєкції Африки.</td>
+              </tr>
+              <tr>
+                <td><strong>North America - NAD83/UTM</strong></td>
+                <td>28</td>
+                <td>NAD83, континентальні рівновеликі СК та NAD83 / UTM 1N–23N.</td>
+              </tr>
+              <tr>
+                <td><strong>South America - SIRGAS 2000/UTM</strong></td>
+                <td>24</td>
+                <td>SIRGAS 2000 та його північні й південні зони UTM.</td>
+              </tr>
+              <tr>
+                <td><strong>Australia and New Zealand - GDA2020/NZGD2000</strong></td>
+                <td>14</td>
+                <td>GDA2020 / MGA 50–59 і NZGD2000 / New Zealand Transverse Mercator 2000.</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <p>
+          Число біля назви в меню показує поточну кількість СК у наборі й може
+          змінитися після редагування або імпорту. У налаштуваннях можна додавати,
+          перейменовувати й видаляти вбудовані та користувацькі набори, редагувати
+          склад СК, додавати опис та екстент застосування, а також імпортувати або
+          експортувати один чи кілька наборів у JSON.
+        </p>
+      </section>
+
+      <section class="card" id="problems">
+        <h2>Типові ситуації</h2>
+
+        <h3>Плагін просить спочатку виділити шари</h3>
+        <p>
+          Виділіть хоча б один коректний векторний або растровий шар у панелі «Шари».
+          Позначка видимості шару не замінює виділення рядка.
+        </p>
+
+        <h3>Нічого не знайдено</h3>
+        <p>
+          Перевірте місце кліку, виберіть ширший набір СК і за потреби дозвольте
+          запасні перетворення. Якщо центроїд даних розташований близько до початку координат, шар може бути
+          в локальній або умовній системі й не мати однозначної прив’язки до місцевості.
+        </p>
+
+        <h3>Пошук триває довго</h3>
+        <p>
+          Використайте менший тематичний набір, увімкніть швидкий режим або груповий
+          підбір для просторово пов’язаних шарів. Пошук серед усієї бази QGIS може
+          перевіряти тисячі визначень СК.
+        </p>
+
+        <h3>Найближча СК накладається неправильно</h3>
+        <p>
+          Відстань — це підказка, а не доказ. Перевірте наступні можливі СК, зверніть
+          увагу на зону проєкції, датум і примітки Fallback/Ballpark. Спробуйте
+          повторити пошук, точніше вказавши місце на карті, або вимкніть приблизні перетворення.
+        </p>
+
+        <h3>Потрібно повернути попередню СК</h3>
+        <p>
+          Скористайтеся кнопкою скасування у вікні результатів, доки воно відкрите.
+          Після закриття вікна історія плагіна очищується, тому перед пакетним
+          призначенням варто зберегти проєкт або записати початкові СК.
+        </p>
+      </section>
+    </main>
+
+    <footer>
+      <p>
+        Плагін розроблено в межах проєкту
+        <a href="https://juliesdata.com/about_ipp" target="_blank" rel="noopener">
+          «Відкриті інструменти просторового планування для України»
+        </a>.
+        Потрібна порада — приєднуйтеся до
+        <a href="https://t.me/+eq7gtxjTXYBjZmUy" target="_blank" rel="noopener">чату JD Help</a>.
+        Помилки й пропозиції можна залишити у
+        <a href="https://github.com/brych92/CRS_Magic/issues" target="_blank" rel="noopener">GitHub Issues</a>.
+      </p>
+    </footer>
+  </div>
+</body>
+</html>
