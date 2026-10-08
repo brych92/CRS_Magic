@@ -20,7 +20,7 @@ from qgis.core import (
 from qgis.PyQt.QtCore import Qt, QTimer, QSettings, QUrl
 from qgis.gui import QgsMapToolEmitPoint, QgsRubberBand
 
-from .find_crs import findCrs
+from .find_crs import clear_all_crs_filter_cache, findCrs
 from .plugin_window import CRSResultsDialog
 from .settings_window import (
     CRSSetSettingsDialog,
@@ -38,9 +38,11 @@ GROUP_SEARCH_SETTINGS_KEY = 'CRS_Magic/group_search'
 DISABLE_FALLBACK_HANDLER_SETTINGS_KEY = 'CRS_Magic/disable_fallback_handler'
 ALLOW_FALLBACK_SETTINGS_KEY = 'CRS_Magic/allow_fallback'
 ALLOW_BALLPARK_SETTINGS_KEY = 'CRS_Magic/allow_ballpark'
+FILTER_BY_CRS_BOUNDS_SETTINGS_KEY = 'CRS_Magic/filter_by_crs_bounds'
 INITIAL_CRS_SETS_VERSION = 1
 CRS_SETS_LIBRARY_DIRECTORY = 'CRS_Magic_finder'
 CRS_SETS_LIBRARY_FILE = 'crs_sets.json'
+TRANSFORM_MESSAGE_LOG_TAG = 'CRS Magic finder / трансформації'
 
 
 class CRS_Magic:
@@ -78,10 +80,17 @@ class CRS_Magic:
         )
         self.allow_fallback = self.load_bool_setting(ALLOW_FALLBACK_SETTINGS_KEY, True)
         self.allow_ballpark = self.load_bool_setting(ALLOW_BALLPARK_SETTINGS_KEY, False)
+        self.filter_by_crs_bounds = self.load_bool_setting(
+            FILTER_BY_CRS_BOUNDS_SETTINGS_KEY,
+            False,
+        )
         self.crs_menu = None
         self.plugin_help_menu = None
         self.plugin_help_action = None
         self.SPT = None
+        self.transform_message_interceptor_connected = False
+        self.transform_message_interceptor_active = False
+        self.transform_message_interceptor_generation = 0
         
     def initGui(self):
         icon = QIcon(os.path.join(self.plugin_dir,"icon.png"))
@@ -101,6 +110,7 @@ class CRS_Magic:
         self.rebuild_crs_menu()
         
     def unload(self):
+        self.disconnect_transform_message_interceptor()
         if self.plugin_help_menu is not None and self.plugin_help_action is not None:
             self.plugin_help_menu.removeAction(self.plugin_help_action)
         if self.plugin_help_action is not None:
@@ -279,7 +289,9 @@ class CRS_Magic:
             "<b>CRS Magic finder</b> ・*.ﾟ☆\n"
             f"Підібрати СК для вибраних векторних і растрових шарів\n"
             f"Набір СК: {self.active_crs_set_label()}\n"
-            f"Пошук: {search_mode}\nРежим СК: {crs_mode}"
+            f"Пошук: {search_mode}\nРежим СК: {crs_mode}\n"
+            'Область застосування СК: '
+            f"{'враховується' if self.filter_by_crs_bounds else 'не враховується'}"
         )
 
     def rebuild_crs_menu(self):
@@ -287,6 +299,7 @@ class CRS_Magic:
             return
 
         self.crs_menu.clear()
+        self.crs_menu.setToolTipsVisible(True)
 
         if self.action_reference is not None:
             main_action = self.crs_menu.addAction(
@@ -300,6 +313,10 @@ class CRS_Magic:
         all_action = self.crs_menu.addAction('Усі СК')
         all_action.setCheckable(True)
         all_action.setChecked(self.active_crs_set == ALL_CRS_SET_KEY)
+        all_action.setToolTip(
+            'Перевірити всі земні горизонтальні 2D-системи координат '
+            'із бази QGIS. Застарілі СК не відсіюються.'
+        )
         all_action.triggered.connect(lambda checked=False: self.set_active_crs_set(ALL_CRS_SET_KEY))
 
         if self.crs_sets:
@@ -309,10 +326,24 @@ class CRS_Magic:
                 action = self.crs_menu.addAction(f'{set_name} ({len(codes)} СК)')
                 action.setCheckable(True)
                 action.setChecked(self.active_crs_set == set_name)
+                description = str(
+                    self.crs_set_metadata.get(set_name, {}).get(
+                        'description',
+                        '',
+                    )
+                ).strip()
+                action.setToolTip(
+                    description
+                    or f'Перевірити {len(codes)} СК із набору «{set_name}».'
+                )
                 action.triggered.connect(lambda checked=False, name=set_name: self.set_active_crs_set(name))
 
         self.crs_menu.addSeparator()
         search_menu = self.crs_menu.addMenu('Режими пошуку')
+        search_menu.setToolTipsVisible(True)
+        search_menu.menuAction().setToolTip(
+            'Налаштувати спосіб підготовки та перевірки можливих СК.'
+        )
 
         fast_mode_action = search_menu.addAction(
             'Швидкий режим (без PROJ-рядків)'
@@ -347,7 +378,29 @@ class CRS_Magic:
             )
         )
 
+        bounds_filter_action = search_menu.addAction(
+            'Фільтрувати за областю застосування СК'
+        )
+        bounds_filter_action.setCheckable(True)
+        bounds_filter_action.setChecked(self.filter_by_crs_bounds)
+        bounds_filter_action.setToolTip(
+            'Залишати лише результати, у яких трансформований центр даних '
+            'лежить в офіційній області застосування відповідної СК. '
+            'СК без визначеної області не відсіюються.'
+        )
+        bounds_filter_action.toggled.connect(
+            lambda enabled: self.set_bool_setting(
+                'filter_by_crs_bounds',
+                FILTER_BY_CRS_BOUNDS_SETTINGS_KEY,
+                enabled,
+            )
+        )
+
         fallback_menu = self.crs_menu.addMenu('Запасні й приблизні перетворення')
+        fallback_menu.setToolTipsVisible(True)
+        fallback_menu.menuAction().setToolTip(
+            'Керувати запасними та приблизними операціями QGIS/PROJ.'
+        )
 
         disable_handler_action = fallback_menu.addAction(
             'Виявляти запасні перетворення (Fallback)'
@@ -398,6 +451,9 @@ class CRS_Magic:
 
         self.crs_menu.addSeparator()
         settings_action = self.crs_menu.addAction('Налаштування…')
+        settings_action.setToolTip(
+            'Відкрити всі параметри пошуку та редактор наборів СК.'
+        )
         settings_action.triggered.connect(self.open_crs_sets_settings)
 
         self.crs_menu.addSeparator()
@@ -407,6 +463,46 @@ class CRS_Magic:
 
         if self.action_reference:
             self.action_reference.setToolTip(self.main_action_tooltip())
+
+    def reset_crs_filter_cache(self):
+        active_task = None
+        results_dialog = getattr(self, 'results_dialog', None)
+        if results_dialog is not None:
+            active_task = getattr(results_dialog, 'task', None)
+        if active_task is not None:
+            return (
+                False,
+                'Дочекайтеся завершення пошуку або скасуйте його перед '
+                'скиданням кешу шейдерів.',
+            )
+
+        memory_entries, removed_files, errors = clear_all_crs_filter_cache()
+        if errors:
+            QgsMessageLog.logMessage(
+                'Не вдалося повністю скинути кеш шейдерів: '
+                + '; '.join(errors),
+                'CRS Magic finder',
+                Qgis.MessageLevel.Warning,
+                False,
+            )
+            return (
+                False,
+                'Кеш шейдерів скинуто частково. Подробиці записано в журнал.',
+            )
+
+        QgsMessageLog.logMessage(
+            'Кеш шейдерів скинуто: '
+            f'записів у пам’яті – {memory_entries}, '
+            f'файлів у профілі QGIS – {removed_files}.',
+            'CRS Magic finder',
+            Qgis.MessageLevel.Info,
+            False,
+        )
+        return (
+            True,
+            'Кеш шейдерів скинуто. Наступний пошук «Усі СК» '
+            'підготує його заново.',
+        )
 
     def open_help(self):
         help_path = os.path.join(self.plugin_dir, 'help', 'index.html')
@@ -436,8 +532,10 @@ class CRS_Magic:
             disable_fallback_handler=self.disable_fallback_handler,
             allow_fallback=self.allow_fallback,
             allow_ballpark=self.allow_ballpark,
+            filter_by_crs_bounds=self.filter_by_crs_bounds,
             source_map_canvas=self.iface.mapCanvas(),
             crs_set_metadata=self.crs_set_metadata,
+            reset_cache_callback=self.reset_crs_filter_cache,
         )
         icon = QIcon(os.path.join(self.plugin_dir, "icon.png"))
         dialog.setWindowIcon(icon)
@@ -473,6 +571,11 @@ class CRS_Magic:
             ALLOW_BALLPARK_SETTINGS_KEY,
             dialog.allow_ballpark(),
         )
+        self.set_bool_setting(
+            'filter_by_crs_bounds',
+            FILTER_BY_CRS_BOUNDS_SETTINGS_KEY,
+            dialog.filter_by_crs_bounds(),
+        )
 
         if self.active_crs_set != ALL_CRS_SET_KEY and self.active_crs_set not in self.crs_sets:
             self.active_crs_set = ALL_CRS_SET_KEY
@@ -485,6 +588,130 @@ class CRS_Magic:
         for message in mbar.items():
             if message.text().startswith("[CRS Magic finder]"):
                 message.dismiss()
+
+    def message_bar_item_text(self, message):
+        parts = []
+        for method_name in ('title', 'text'):
+            method = getattr(message, method_name, None)
+            if not callable(method):
+                continue
+            try:
+                value = str(method() or '').strip()
+            except (AttributeError, RuntimeError):
+                continue
+            if value and value not in parts:
+                parts.append(value)
+        return ' '.join(parts)
+
+    def is_preferred_transform_message(self, message):
+        text = self.message_bar_item_text(message)
+        if not text:
+            return False
+        lower_text = text.casefold()
+        preferred_marker = (
+            'переваж' in lower_text
+            or 'preferred' in lower_text
+        )
+        transform_marker = (
+            'перетвор' in lower_text
+            or 'transform' in lower_text
+        )
+        return preferred_marker and transform_marker
+
+    def connect_transform_message_interceptor(self):
+        if getattr(self, 'transform_message_interceptor_connected', False):
+            return
+        try:
+            self.iface.messageBar().widgetAdded.connect(
+                self.on_message_bar_widget_added
+            )
+        except (AttributeError, RuntimeError):
+            return
+        self.transform_message_interceptor_connected = True
+
+    def disconnect_transform_message_interceptor(self):
+        self.stop_transform_message_interception()
+        if not getattr(self, 'transform_message_interceptor_connected', False):
+            return
+        try:
+            self.iface.messageBar().widgetAdded.disconnect(
+                self.on_message_bar_widget_added
+            )
+        except (AttributeError, RuntimeError, TypeError):
+            pass
+        self.transform_message_interceptor_connected = False
+
+    def start_transform_message_interception(self):
+        self.connect_transform_message_interceptor()
+        self.transform_message_interceptor_generation = (
+            getattr(self, 'transform_message_interceptor_generation', 0) + 1
+        )
+        self.transform_message_interceptor_active = True
+
+    def stop_transform_message_interception(self, expected_generation=None):
+        if (
+            expected_generation is not None
+            and expected_generation
+            != getattr(self, 'transform_message_interceptor_generation', 0)
+        ):
+            return
+        self.transform_message_interceptor_active = False
+
+    def schedule_transform_message_interception_stop(self):
+        generation = getattr(
+            self,
+            'transform_message_interceptor_generation',
+            0,
+        )
+        QTimer.singleShot(
+            250,
+            lambda: self.stop_transform_message_interception(generation),
+        )
+
+    def on_message_bar_widget_added(self, widget):
+        if not getattr(self, 'transform_message_interceptor_active', False):
+            return
+        generation = getattr(
+            self,
+            'transform_message_interceptor_generation',
+            0,
+        )
+        QTimer.singleShot(
+            0,
+            lambda: self.drain_preferred_transform_messages(generation),
+        )
+
+    def drain_preferred_transform_messages(self, expected_generation):
+        if not getattr(self, 'transform_message_interceptor_active', False):
+            return
+        if expected_generation != getattr(
+            self,
+            'transform_message_interceptor_generation',
+            0,
+        ):
+            return
+        try:
+            messages = list(self.iface.messageBar().items())
+        except (AttributeError, RuntimeError):
+            return
+        for message in messages:
+            if not self.is_preferred_transform_message(message):
+                continue
+            text = self.message_bar_item_text(message)
+            QgsMessageLog.logMessage(
+                text,
+                TRANSFORM_MESSAGE_LOG_TAG,
+                Qgis.MessageLevel.Warning,
+                False,
+            )
+            self.dismiss_intercepted_message(message)
+
+    def dismiss_intercepted_message(self, message):
+        try:
+            if message in self.iface.messageBar().items():
+                message.dismiss()
+        except (AttributeError, RuntimeError):
+            pass
 
     def configure_transform_fallback(self, transformation):
         transformation.disableFallbackOperationHandler(self.disable_fallback_handler)
@@ -506,6 +733,7 @@ class CRS_Magic:
 
         def status_changed(status):
             if status==3:
+                self.schedule_transform_message_interception_stop()
                 fk_b_s=r'<span style="color:black">'
                 fk_r_s='<span style="color:red">'
                 fk_e=r'</span>'
@@ -580,6 +808,7 @@ class CRS_Magic:
                 # print(task.message)
                 return
             if status==4:
+                self.schedule_transform_message_interception_stop()
                 self.clearMBar()
                 # print(task.message)
                 # print(task.last_action)
@@ -653,6 +882,7 @@ class CRS_Magic:
             self.disable_fallback_handler,
             self.allow_fallback,
             self.allow_ballpark,
+            self.filter_by_crs_bounds,
             transform_context,
         )
         self.results_dialog.set_task(task)
@@ -663,7 +893,12 @@ class CRS_Magic:
         
         task.statusChanged.connect(status_changed)
         task.setDependentLayers(self.layers)
-        QgsApplication.taskManager().addTask(task)
+        self.start_transform_message_interception()
+        try:
+            QgsApplication.taskManager().addTask(task)
+        except Exception:
+            self.stop_transform_message_interception()
+            raise
         
         print('Запускаю процес підбору...')
     

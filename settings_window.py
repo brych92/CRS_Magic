@@ -843,11 +843,14 @@ class CRSSetSettingsDialog(QDialog):
         disable_fallback_handler=True,
         allow_fallback=True,
         allow_ballpark=False,
+        filter_by_crs_bounds=False,
         source_map_canvas=None,
         crs_set_metadata=None,
+        reset_cache_callback=None,
     ):
         super().__init__(parent)
         self.source_map_canvas = source_map_canvas
+        self.reset_cache_callback = reset_cache_callback
         self.crs_sets = {}
         for name, codes in crs_sets.items():
             normalized_codes = parse_crs_codes('\n'.join(codes))
@@ -945,6 +948,17 @@ class CRSSetSettingsDialog(QDialog):
             'роботу з кількома просторово пов’язаними шарами.'
         )
 
+        self.bounds_filter_checkbox = QCheckBox(
+            'Фільтрувати за областю застосування СК'
+        )
+        self.bounds_filter_checkbox.setChecked(bool(filter_by_crs_bounds))
+        self.bounds_filter_checkbox.setToolTip(
+            'Перевіряє, чи трансформований центр даних лежить в офіційній '
+            'області застосування СК. Перед трансформацією також пропускає СК, '
+            'область яких не перетинає район 200 км навколо точки кліку. '
+            'СК без визначеної області застосування залишаються в пошуку.'
+        )
+
         self.disable_fallback_handler_checkbox = QCheckBox(
             'Виявляти запасні перетворення (Fallback)'
         )
@@ -974,15 +988,29 @@ class CRSSetSettingsDialog(QDialog):
             'не гарантується. Має пріоритет над забороною запасних перетворень.'
         )
 
+        self.reset_cache_button = QPushButton('Скинути кеш шейдерів')
+        self.reset_cache_button.setIcon(qgis_icon(
+            ['mActionDeleteSelected.svg', 'mActionRemove.svg'],
+            QStyle.SP_TrashIcon,
+        ))
+        self.reset_cache_button.setToolTip(
+            'Очистити відфільтрований список СК у пам’яті та профілі QGIS. '
+            'Наступний пошук у режимі «Усі СК» підготує список заново.'
+        )
+        self.reset_cache_button.setEnabled(callable(self.reset_cache_callback))
+        self.reset_cache_button.clicked.connect(self.reset_filter_cache)
+
         left_layout = QVBoxLayout()
         left_layout.addWidget(QLabel('Набори'))
         left_layout.addWidget(self.sets_list)
         left_layout.addLayout(set_buttons_layout)
         left_layout.addWidget(self.fast_mode_checkbox)
         left_layout.addWidget(self.group_search_checkbox)
+        left_layout.addWidget(self.bounds_filter_checkbox)
         left_layout.addWidget(self.disable_fallback_handler_checkbox)
         left_layout.addWidget(self.allow_fallback_checkbox)
         left_layout.addWidget(self.allow_ballpark_checkbox)
+        left_layout.addWidget(self.reset_cache_button)
         left_widget = QWidget()
         left_widget.setLayout(left_layout)
 
@@ -1442,6 +1470,15 @@ class CRSSetSettingsDialog(QDialog):
             if name.strip() and codes
         }
 
+    def reset_filter_cache(self):
+        if not callable(self.reset_cache_callback):
+            return
+        success, message = self.reset_cache_callback()
+        if success:
+            QMessageBox.information(self, 'Кеш шейдерів', message)
+        else:
+            QMessageBox.warning(self, 'Кеш шейдерів', message)
+
     def result_metadata(self):
         return {
             name: metadata
@@ -1460,6 +1497,9 @@ class CRSSetSettingsDialog(QDialog):
 
     def group_search(self):
         return self.group_search_checkbox.isChecked()
+
+    def filter_by_crs_bounds(self):
+        return self.bounds_filter_checkbox.isChecked()
 
     def disable_fallback_handler(self):
         return self.disable_fallback_handler_checkbox.isChecked()

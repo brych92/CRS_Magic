@@ -1,14 +1,22 @@
+import hashlib
+import json
 import math
+import os
 import random
 import statistics
+import threading
+import time
 
 from qgis.core import (
+    Qgis,
+    QgsApplication,
     QgsCoordinateReferenceSystem,
     QgsCoordinateTransform,
     QgsCoordinateTransformContext,
     QgsDistanceArea,
     QgsFeatureRequest,
     QgsMapLayerType,
+    QgsMessageLog,
     QgsPointXY,
     QgsRectangle,
     QgsTask,
@@ -16,11 +24,67 @@ from qgis.core import (
 from qgis.PyQt.QtCore import pyqtSignal
 
 
+CRS_FILTER_CACHE_VERSION = 1
+CRS_FILTER_PERSIST_THRESHOLD_SECONDS = 30.0
+CRS_FILTER_CACHE_DIRECTORY = 'CRS_Magic_finder/crs_filter_cache'
+CRS_FILTER_STATUS = '☢️ Компілюються шейдери, будь ласка зачекайте…'
+CRS_FILTER_PROGRESS_WEIGHT = 10
+UI_UPDATE_INTERVAL_SECONDS = 0.1
+
+_ALL_CRS_MEMORY_CACHE = {}
+_ALL_CRS_MEMORY_CACHE_LOCK = threading.Lock()
+
+
+def crs_filter_cache_directory():
+    try:
+        settings_directory = str(QgsApplication.qgisSettingsDirPath() or '')
+    except Exception:
+        return None
+    if not settings_directory:
+        return None
+    return os.path.join(
+        settings_directory,
+        *CRS_FILTER_CACHE_DIRECTORY.split('/'),
+    )
+
+
+def clear_all_crs_filter_cache():
+    with _ALL_CRS_MEMORY_CACHE_LOCK:
+        memory_entries = len(_ALL_CRS_MEMORY_CACHE)
+        _ALL_CRS_MEMORY_CACHE.clear()
+
+    removed_files = 0
+    errors = []
+    cache_directory = crs_filter_cache_directory()
+    if not cache_directory or not os.path.isdir(cache_directory):
+        return memory_entries, removed_files, errors
+
+    try:
+        entries = list(os.scandir(cache_directory))
+    except OSError as error:
+        return memory_entries, removed_files, [str(error)]
+
+    for entry in entries:
+        if not entry.name.endswith('.json'):
+            continue
+        try:
+            if not entry.is_file(follow_symlinks=False):
+                continue
+            os.remove(entry.path)
+            removed_files += 1
+        except OSError as error:
+            errors.append(f'{entry.name}: {error}')
+
+    return memory_entries, removed_files, errors
+
+
 class findCrs(QgsTask):
     crsChecked = pyqtSignal(str, str, str, str, int, object, str)
     statsChanged = pyqtSignal(int, int, int, int, int, int)
     groupsPrepared = pyqtSignal(object)
     geographicCrsSkipped = pyqtSignal(str)
+    phaseChanged = pyqtSignal(str)
+    phaseProgressChanged = pyqtSignal(float)
 
     def __init__(
         self,
@@ -35,6 +99,7 @@ class findCrs(QgsTask):
         disable_fallback_handler=True,
         allow_fallback=True,
         allow_ballpark=False,
+        filter_by_crs_bounds=False,
         transform_context=None,
     ):
         super().__init__(description, QgsTask.CanCancel)        
@@ -52,6 +117,7 @@ class findCrs(QgsTask):
         self.disable_fallback_handler = bool(disable_fallback_handler)
         self.allow_fallback = bool(allow_fallback)
         self.allow_ballpark = bool(allow_ballpark)
+        self.filter_by_crs_bounds = bool(filter_by_crs_bounds)
         self.project_transform_context = transform_context
         
         self.failure_reason=None
@@ -66,6 +132,14 @@ class findCrs(QgsTask):
         self.failed_crs_qty=0
         self.matched_crs_qty=0
         self.fallback_crs_qty=0
+        self.unsupported_crs_type_qty=0
+        self.non_earth_crs_qty=0
+        self.bounds_filtered_crs_qty=0
+        self.bounds_filtered_result_qty=0
+        self.catalog_crs_qty=0
+        self.invalid_catalog_crs_qty=0
+        self.catalog_filter_seconds=0.0
+        self.catalog_cache_source=''
         # Підготовка центрів зазвичай значно коротша за перевірку тисяч СК,
         # тому вона займає лише перші 5% індикатора. Останній відсоток
         # залишається для формування підсумку після перевірки кандидатів.
@@ -156,6 +230,10 @@ class findCrs(QgsTask):
         self.search_units = []
         self.transformContext = None
         self.distance_calculator = None
+        self.wgs84_crs = None
+        self.canvas_to_wgs84_transform = None
+        self.bounds_search_rectangle = None
+        self.last_stats_emit_time = 0.0
     
     def normalize_crs_codes(self, crs_codes):
         result = []
@@ -181,11 +259,436 @@ class findCrs(QgsTask):
         self.distance_calculator.setSourceCrs(self.canvas_crs, self.transformContext)
         self.distance_calculator.setEllipsoid('WGS84')
 
+        if self.filter_by_crs_bounds:
+            self.wgs84_crs = QgsCoordinateReferenceSystem('EPSG:4326')
+            self.canvas_to_wgs84_transform = QgsCoordinateTransform(
+                self.canvas_crs,
+                self.wgs84_crs,
+                self.transformContext,
+            )
+            self.bounds_search_rectangle = self.build_bounds_search_rectangle()
+
+    def build_bounds_search_rectangle(self):
+        try:
+            click_wgs84 = self.canvas_to_wgs84_transform.transform(
+                self.click_point
+            )
+            geodesic = QgsDistanceArea()
+            geodesic.setSourceCrs(self.wgs84_crs, self.transformContext)
+            geodesic.setEllipsoid('WGS84')
+            points = [click_wgs84]
+            for azimuth in (0, math.pi / 2, math.pi, 3 * math.pi / 2):
+                points.append(
+                    geodesic.computeSpheroidProject(
+                        click_wgs84,
+                        self.max_result_distance,
+                        azimuth,
+                    )
+                )
+
+            coordinates = [
+                value
+                for point in points
+                for value in (point.x(), point.y())
+            ]
+            if not all(math.isfinite(value) for value in coordinates):
+                return None
+
+            rectangle = QgsRectangle(
+                min(point.x() for point in points),
+                min(point.y() for point in points),
+                max(point.x() for point in points),
+                max(point.y() for point in points),
+            )
+            # A rectangle spanning most longitudes usually crosses the date line.
+            # Disabling the early filter there avoids false exclusions.
+            if rectangle.width() > 180:
+                return None
+            return rectangle
+        except Exception:
+            return None
+
+    def crs_wkt2(self, crs):
+        variant = getattr(
+            QgsCoordinateReferenceSystem,
+            'WKT2_2019',
+            getattr(QgsCoordinateReferenceSystem, 'WKT2_2018', None),
+        )
+        try:
+            if variant is None:
+                return crs.toWkt()
+            return crs.toWkt(variant)
+        except Exception:
+            return ''
+
+    def crs_is_supported_horizontal_2d(self, crs):
+        crs_type_method = getattr(crs, 'type', None)
+        crs_type_enum = getattr(Qgis, 'CrsType', None)
+        if callable(crs_type_method) and crs_type_enum is not None:
+            allowed_types = tuple(
+                crs_type
+                for crs_type in (
+                    getattr(crs_type_enum, 'Projected', None),
+                    getattr(crs_type_enum, 'Geographic2d', None),
+                    getattr(crs_type_enum, 'DerivedProjected', None),
+                )
+                if crs_type is not None
+            )
+            try:
+                return crs_type_method() in allowed_types
+            except Exception:
+                pass
+
+        wkt = self.crs_wkt2(crs)
+        root = wkt.lstrip().split('[', 1)[0].upper()
+        if root in ('PROJCRS', 'DERIVEDPROJCRS', 'PROJCS'):
+            return True
+        if root == 'GEOGCRS':
+            compact_wkt = ''.join(wkt.split()).lower()
+            return 'cs[ellipsoidal,2]' in compact_wkt
+        if root == 'GEOGCS':
+            return True
+        if root:
+            return False
+
+        try:
+            if crs.isGeographic():
+                return True
+            acronym = str(crs.projectionAcronym() or '').strip().lower()
+            return bool(acronym) and acronym != 'geocent'
+        except Exception:
+            return False
+
+    def crs_is_earth(self, crs):
+        try:
+            celestial_body = str(crs.celestialBodyName() or '').strip()
+        except Exception:
+            return True
+        return not celestial_body or celestial_body.casefold() == 'earth'
+
+    def usable_crs_bounds(self, crs):
+        try:
+            bounds = crs.bounds()
+            coordinates = (
+                bounds.xMinimum(),
+                bounds.yMinimum(),
+                bounds.xMaximum(),
+                bounds.yMaximum(),
+            )
+            if bounds.isEmpty() or not all(
+                math.isfinite(value) for value in coordinates
+            ):
+                return None
+            return bounds
+        except Exception:
+            return None
+
+    def crs_bounds_intersect_search_area(self, crs):
+        if not self.filter_by_crs_bounds:
+            return True
+        bounds = self.usable_crs_bounds(crs)
+        if bounds is None or self.bounds_search_rectangle is None:
+            return True
+        if bounds.width() > 180:
+            return True
+        return self.extents_intersect(bounds, self.bounds_search_rectangle)
+
+    def transformed_point_is_within_crs_bounds(self, crs, transformed_point):
+        if not self.filter_by_crs_bounds:
+            return True
+        bounds = self.usable_crs_bounds(crs)
+        if bounds is None:
+            return True
+        try:
+            point_wgs84 = self.canvas_to_wgs84_transform.transform(
+                transformed_point
+            )
+            if bounds.contains(point_wgs84):
+                return True
+            # Preserve ambiguous/global bounds near the date line.
+            return bounds.width() > 180
+        except Exception:
+            return True
+
+    def crs_database_signature(self, method_name):
+        method = getattr(QgsApplication, method_name, None)
+        if not callable(method):
+            return None
+        try:
+            path = os.path.realpath(str(method() or ''))
+            if not path:
+                return None
+            stat = os.stat(path)
+            return {
+                'path': os.path.normcase(path),
+                'size': stat.st_size,
+                'mtime_ns': getattr(
+                    stat,
+                    'st_mtime_ns',
+                    int(stat.st_mtime * 1_000_000_000),
+                ),
+            }
+        except (OSError, TypeError, ValueError):
+            return None
+
+    def crs_catalog_fingerprint(self, srs_ids):
+        ids_hash = hashlib.sha256()
+        for srs_id in srs_ids:
+            ids_hash.update(str(int(srs_id)).encode('ascii'))
+            ids_hash.update(b',')
+
+        details = {
+            'cache_version': CRS_FILTER_CACHE_VERSION,
+            'qgis_version': str(getattr(Qgis, 'QGIS_VERSION', '')),
+            'qgis_version_int': int(getattr(Qgis, 'QGIS_VERSION_INT', 0)),
+            'srs_count': len(srs_ids),
+            'srs_ids_sha256': ids_hash.hexdigest(),
+            'system_crs_database': self.crs_database_signature(
+                'srsDatabaseFilePath'
+            ),
+            'user_crs_database': self.crs_database_signature(
+                'qgisUserDatabaseFilePath'
+            ),
+        }
+        serialized = json.dumps(
+            details,
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(',', ':'),
+        ).encode('ascii')
+        return hashlib.sha256(serialized).hexdigest(), details
+
+    def crs_filter_cache_path(self, fingerprint):
+        cache_directory = crs_filter_cache_directory()
+        if not cache_directory:
+            return None
+        return os.path.join(
+            cache_directory,
+            f'{fingerprint}.json',
+        )
+
+    def normalized_crs_cache_entry(self, data, fingerprint, raw_srs_ids):
+        if not isinstance(data, dict):
+            return None
+        if data.get('fingerprint') != fingerprint:
+            return None
+        if int(data.get('cache_version', 0)) != CRS_FILTER_CACHE_VERSION:
+            return None
+        try:
+            candidate_ids = tuple(int(value) for value in data['srs_ids'])
+        except (KeyError, TypeError, ValueError):
+            return None
+        raw_ids = set(raw_srs_ids)
+        if len(candidate_ids) != len(set(candidate_ids)):
+            return None
+        if any(srs_id not in raw_ids for srs_id in candidate_ids):
+            return None
+        counts = data.get('counts', {})
+        try:
+            normalized_counts = {
+                'invalid': max(0, int(counts.get('invalid', 0))),
+                'unsupported': max(0, int(counts.get('unsupported', 0))),
+                'non_earth': max(0, int(counts.get('non_earth', 0))),
+            }
+        except (TypeError, ValueError):
+            return None
+        try:
+            filter_seconds = max(
+                0.0,
+                float(data.get('filter_seconds', 0.0)),
+            )
+        except (TypeError, ValueError):
+            return None
+        return {
+            'srs_ids': candidate_ids,
+            'counts': normalized_counts,
+            'filter_seconds': filter_seconds,
+        }
+
+    def load_filtered_crs_cache(self, fingerprint, raw_srs_ids):
+        with _ALL_CRS_MEMORY_CACHE_LOCK:
+            memory_data = _ALL_CRS_MEMORY_CACHE.get(fingerprint)
+        entry = self.normalized_crs_cache_entry(
+            memory_data,
+            fingerprint,
+            raw_srs_ids,
+        )
+        if entry is not None:
+            return entry, 'memory'
+
+        cache_path = self.crs_filter_cache_path(fingerprint)
+        if not cache_path or not os.path.isfile(cache_path):
+            return None, ''
+        try:
+            with open(cache_path, 'r', encoding='utf-8') as cache_file:
+                disk_data = json.load(cache_file)
+        except (OSError, ValueError, TypeError):
+            return None, ''
+
+        entry = self.normalized_crs_cache_entry(
+            disk_data,
+            fingerprint,
+            raw_srs_ids,
+        )
+        if entry is None:
+            return None, ''
+        memory_data = {
+            'cache_version': CRS_FILTER_CACHE_VERSION,
+            'fingerprint': fingerprint,
+            'srs_ids': list(entry['srs_ids']),
+            'counts': dict(entry['counts']),
+            'filter_seconds': entry['filter_seconds'],
+        }
+        with _ALL_CRS_MEMORY_CACHE_LOCK:
+            _ALL_CRS_MEMORY_CACHE[fingerprint] = memory_data
+        return entry, 'disk'
+
+    def save_filtered_crs_cache(
+        self,
+        fingerprint,
+        catalog_details,
+        candidate_ids,
+        counts,
+        filter_seconds,
+    ):
+        cache_data = {
+            'cache_version': CRS_FILTER_CACHE_VERSION,
+            'fingerprint': fingerprint,
+            'catalog': catalog_details,
+            'srs_ids': [int(value) for value in candidate_ids],
+            'counts': dict(counts),
+            'filter_seconds': float(filter_seconds),
+        }
+        with _ALL_CRS_MEMORY_CACHE_LOCK:
+            _ALL_CRS_MEMORY_CACHE[fingerprint] = cache_data
+
+        if filter_seconds <= CRS_FILTER_PERSIST_THRESHOLD_SECONDS:
+            return
+        cache_path = self.crs_filter_cache_path(fingerprint)
+        if not cache_path:
+            return
+        temporary_path = (
+            f'{cache_path}.{os.getpid()}.{threading.get_ident()}.tmp'
+        )
+        try:
+            os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+            with open(temporary_path, 'w', encoding='utf-8') as cache_file:
+                json.dump(
+                    cache_data,
+                    cache_file,
+                    ensure_ascii=False,
+                    separators=(',', ':'),
+                )
+                cache_file.write('\n')
+            os.replace(temporary_path, cache_path)
+        except OSError as error:
+            try:
+                if os.path.isfile(temporary_path):
+                    os.remove(temporary_path)
+            except OSError:
+                pass
+            QgsMessageLog.logMessage(
+                f'Не вдалося зберегти кеш відфільтрованих СК: {error}',
+                'CRS Magic finder',
+                Qgis.MessageLevel.Warning,
+                False,
+            )
+
+    def apply_crs_cache_counts(self, entry):
+        counts = entry['counts']
+        self.invalid_catalog_crs_qty = counts['invalid']
+        self.unsupported_crs_type_qty = counts['unsupported']
+        self.non_earth_crs_qty = counts['non_earth']
+        self.catalog_filter_seconds = entry['filter_seconds']
+
+    def prepare_all_crs_candidates(self, filter_progress_start):
+        try:
+            raw_srs_ids = list(QgsCoordinateReferenceSystem.validSrsIds())
+        except Exception:
+            raw_srs_ids = []
+        self.catalog_crs_qty = len(raw_srs_ids)
+        if not raw_srs_ids:
+            return []
+
+        fingerprint, catalog_details = self.crs_catalog_fingerprint(raw_srs_ids)
+        cached_entry, cache_source = self.load_filtered_crs_cache(
+            fingerprint,
+            raw_srs_ids,
+        )
+        if cached_entry is not None:
+            self.apply_crs_cache_counts(cached_entry)
+            self.catalog_cache_source = cache_source
+            return [(srs_id, None) for srs_id in cached_entry['srs_ids']]
+
+        self.phaseChanged.emit(CRS_FILTER_STATUS)
+        self.phaseProgressChanged.emit(0.0)
+        filter_started = time.monotonic()
+        last_progress_update = filter_started
+        candidates = []
+        counts = {'invalid': 0, 'unsupported': 0, 'non_earth': 0}
+        filter_completed = False
+        try:
+            for index, srs_id in enumerate(raw_srs_ids, 1):
+                if self.isCanceled():
+                    self.failure_reason = 'Підбір СК скасовано користувачем'
+                    return None
+                try:
+                    crs = QgsCoordinateReferenceSystem.fromSrsId(srs_id)
+                    if not crs.isValid():
+                        counts['invalid'] += 1
+                    elif not self.crs_is_supported_horizontal_2d(crs):
+                        counts['unsupported'] += 1
+                    elif not self.crs_is_earth(crs):
+                        counts['non_earth'] += 1
+                    else:
+                        candidates.append((srs_id, crs))
+                except Exception:
+                    counts['invalid'] += 1
+
+                now = time.monotonic()
+                if now - last_progress_update >= UI_UPDATE_INTERVAL_SECONDS:
+                    filter_progress = 100.0 * index / len(raw_srs_ids)
+                    self.phaseProgressChanged.emit(filter_progress)
+                    self.setProgress(
+                        filter_progress_start
+                        + CRS_FILTER_PROGRESS_WEIGHT * index / len(raw_srs_ids)
+                    )
+                    last_progress_update = now
+            filter_completed = True
+        finally:
+            if filter_completed:
+                self.phaseProgressChanged.emit(100.0)
+            self.phaseChanged.emit('')
+
+        filter_seconds = time.monotonic() - filter_started
+        candidate_ids = [srs_id for srs_id, _ in candidates]
+        self.save_filtered_crs_cache(
+            fingerprint,
+            catalog_details,
+            candidate_ids,
+            counts,
+            filter_seconds,
+        )
+        self.apply_crs_cache_counts({
+            'counts': counts,
+            'filter_seconds': filter_seconds,
+        })
+        self.catalog_cache_source = 'built'
+        self.setProgress(filter_progress_start + CRS_FILTER_PROGRESS_WEIGHT)
+        return candidates
+
 
     def getFailure(self):
         return self.failure_reason
 
-    def emit_stats(self):
+    def emit_stats(self, force=False):
+        now = time.monotonic()
+        if (
+            not force
+            and now - self.last_stats_emit_time < UI_UPDATE_INTERVAL_SECONDS
+        ):
+            return
+        self.last_stats_emit_time = now
         self.statsChanged.emit(
             self.total_crs_to_check,
             self.processed_crs_qty,
@@ -517,26 +1020,37 @@ class findCrs(QgsTask):
     def range_distances(self, centers, click_point):
         self.skipped_crs_qty=0
         self.unit_filtered_crs_qty=0
+        self.unsupported_crs_type_qty=0
+        self.non_earth_crs_qty=0
+        self.bounds_filtered_crs_qty=0
+        self.bounds_filtered_result_qty=0
+        self.catalog_crs_qty=0
+        self.invalid_catalog_crs_qty=0
+        self.catalog_filter_seconds=0.0
+        self.catalog_cache_source=''
         distance_results = {layer_id: [] for layer_id in centers}
         known_crs=set()
 
-        srs_ids = []
+        candidate_entries = []
         selected_crs_mode = self.crs_codes is not None
+        catalog_filter_progress_weight = 0
         if selected_crs_mode:
             total_crs_qty=len(self.crs_codes)
             self.message=self.message+f'Перевіряємо {total_crs_qty} СК з набору "{self.crs_set_name}"\r\n'
         else:
-            try:
-                srs_ids = QgsCoordinateReferenceSystem.validSrsIds()
-            except Exception:
-                srs_ids = []
-                self.skipped_crs_qty=self.skipped_crs_qty+1
-
-            total_crs_qty=len(srs_ids)
-            self.message=self.message+f'Перевіряємо до {total_crs_qty} СК з бази QGIS\r\n'
+            candidate_entries = self.prepare_all_crs_candidates(self.progress())
+            if candidate_entries is None:
+                return None
+            total_crs_qty=len(candidate_entries)
+            if self.catalog_cache_source == 'built':
+                catalog_filter_progress_weight = CRS_FILTER_PROGRESS_WEIGHT
+            self.message=self.message+(
+                f'Каталог QGIS: {self.catalog_crs_qty} СК; '
+                f'перевіряємо {total_crs_qty} релевантних кандидатів\r\n'
+            )
 
         self.total_crs_to_check = total_crs_qty
-        self.emit_stats()
+        self.emit_stats(force=True)
 
         if total_crs_qty == 0:
             if selected_crs_mode:
@@ -546,11 +1060,14 @@ class findCrs(QgsTask):
             return None
 
         search_start_progress = self.progress()
+        search_progress_weight = (
+            self.crs_progress_weight - catalog_filter_progress_weight
+        )
 
         def update_search_progress():
             self.setProgress(
                 search_start_progress
-                + self.crs_progress_weight
+                + search_progress_weight
                 * self.processed_crs_qty
                 / total_crs_qty
             )
@@ -563,6 +1080,11 @@ class findCrs(QgsTask):
             try:
                 if not crs.isValid():
                     self.failed_crs_qty=self.failed_crs_qty+1
+                    return True
+
+                if not self.crs_bounds_intersect_search_area(crs):
+                    self.bounds_filtered_crs_qty += 1
+                    self.skipped_crs_qty += 1
                     return True
 
                 real_crs_code = crs.authid() or crs_code
@@ -608,6 +1130,12 @@ class findCrs(QgsTask):
                             continue
 
                         candidate_succeeded = True
+                        if not self.transformed_point_is_within_crs_bounds(
+                            crs,
+                            transformed_center,
+                        ):
+                            self.bounds_filtered_result_qty += 1
+                            continue
                         distance = self.distance_calculator.measureLine(
                             click_point,
                             transformed_center,
@@ -666,9 +1194,11 @@ class findCrs(QgsTask):
                 self.emit_stats()
                 update_search_progress()
         else:
-            for srs_id in srs_ids:
+            for srs_id, prepared_crs in candidate_entries:
                 try:
-                    crs = QgsCoordinateReferenceSystem.fromSrsId(srs_id)
+                    crs = prepared_crs
+                    if crs is None:
+                        crs = QgsCoordinateReferenceSystem.fromSrsId(srs_id)
                     crs_code = crs.authid() or f'QGIS:{crs.srsid()}'
                     if not process_crs(crs_code, crs):
                         return None
@@ -678,6 +1208,8 @@ class findCrs(QgsTask):
                 self.processed_crs_qty=self.processed_crs_qty+1
                 self.emit_stats()
                 update_search_progress()
+
+        self.emit_stats(force=True)
             
         for layer_id, layer_results in distance_results.items():
             if not layer_results:
@@ -705,6 +1237,31 @@ class findCrs(QgsTask):
         if self.skipped_crs_qty:
             self.message = self.message + (
                 f'Пропущено СК під час перевірки: {self.skipped_crs_qty}\r\n'
+            )
+        if self.unsupported_crs_type_qty:
+            self.message = self.message + (
+                'Відсіяно непідтримуваних типів СК у режимі «Усі СК»: '
+                f'{self.unsupported_crs_type_qty}\r\n'
+            )
+        if self.non_earth_crs_qty:
+            self.message = self.message + (
+                'Відсіяно СК інших небесних тіл: '
+                f'{self.non_earth_crs_qty}\r\n'
+            )
+        if self.invalid_catalog_crs_qty:
+            self.message = self.message + (
+                'Пропущено некоректних записів каталогу QGIS: '
+                f'{self.invalid_catalog_crs_qty}\r\n'
+            )
+        if self.bounds_filtered_crs_qty:
+            self.message = self.message + (
+                'Відсіяно СК за областю застосування до трансформації: '
+                f'{self.bounds_filtered_crs_qty}\r\n'
+            )
+        if self.bounds_filtered_result_qty:
+            self.message = self.message + (
+                'Відсіяно результатів поза областю застосування СК: '
+                f'{self.bounds_filtered_result_qty}\r\n'
             )
         if self.unit_filtered_crs_qty:
             self.message = self.message + (

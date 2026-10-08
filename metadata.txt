@@ -1,20 +1,25 @@
 [general]
 name=CRS Magic finder DEV
-qgisMinimumVersion=3.18
-description=Find and assign likely coordinate reference systems for vector and raster layers
-description[uk]=Підбір і призначення ймовірних систем координат для векторних і растрових шарів
+qgisMinimumVersion=3.28
+description=Find and assign likely coordinate reference systems without georeferencing or changing source coordinates
+description[uk]=Підбір і призначення ймовірних систем координат без геоприв’язки або зміни вихідних координат
 tags=CRS, coordinate reference system, coordinate system, projection, vector layers, raster layers, генплан, геоприв’язка, система координат, проєкція
 version=0.8.0
 author=Стьопа
 email=brych92@gmail.com
-about=<div><b>CRS Magic finder</b> helps determine a likely coordinate reference system (CRS) for vector and raster layers whose CRS is missing or assigned incorrectly. It compares the calculated location of the selected data with a reference point marked by the user on the map, searches all CRS definitions available in QGIS or a saved custom set, and displays suitable candidates with their distances.</div><div style="margin-top:8px;">The nearest result can be assigned automatically, while another candidate can be applied manually to one or more selected layers. The plugin changes the CRS assigned to a layer but does not reproject the source file or modify its coordinates.</div><div style="margin-top:8px;">Detailed instructions are available from <b>Help</b> in the plugin menu.</div>
-about[uk]=<div><b>CRS Magic finder</b> допомагає визначити ймовірну систему координат (СК) для векторних і растрових шарів, у яких СК відсутня або призначена неправильно. Плагін порівнює обчислене розташування вибраних даних із точкою, яку користувач указує на карті, перевіряє усі СК, доступні у QGIS або в збереженому наборі, і показує можливі варіанти з відстанями.</div><div style="margin-top:8px;">Найближчу знайдену СК плагін може призначити автоматично, а іншу — вручну одному або кільком виділеним шарам. Плагін змінює СК, призначену шару, але не перепроєктовує вихідний файл і не змінює його координати.</div><div style="margin-top:8px;">Детальна інструкція доступна через пункт <b>«Довідка»</b> у меню плагіна.</div>
+about=<div><b>CRS Magic finder</b> helps determine a likely coordinate reference system (CRS) for vector and raster layers whose CRS is missing or assigned incorrectly. It compares the calculated location of the selected data with a reference point marked by the user on the map, searches Earth-based horizontal 2D CRS definitions available in QGIS or a saved custom set, and displays suitable candidates with their distances.</div><div style="margin-top:8px;">The nearest result can be assigned automatically, while another candidate can be applied manually to one or more selected layers. This is not georeferencing: the plugin changes the CRS assigned to a layer but does not calculate control-point transformations, reproject the source file, or modify its coordinates.</div><div style="margin-top:8px;">Detailed instructions are available from <b>Help</b> in the plugin menu.</div>
+about[uk]=<div><b>CRS Magic finder</b> допомагає визначити ймовірну систему координат (СК) для векторних і растрових шарів, у яких СК відсутня або призначена неправильно. Плагін порівнює обчислене розташування вибраних даних із точкою, яку користувач указує на карті, перевіряє земні горизонтальні 2D-системи з бази QGIS або збережений користувацький набір і показує можливі варіанти з відстанями.</div><div style="margin-top:8px;">Найближчу знайдену СК плагін може призначити автоматично, а іншу – вручну одному або кільком виділеним шарам. Це не геоприв’язка: плагін змінює СК, призначену шару, але не обчислює перетворення за контрольними точками, не перепроєктовує вихідний файл і не змінює його координати.</div><div style="margin-top:8px;">Детальна інструкція доступна через пункт <b>«Довідка»</b> у меню плагіна.</div>
 tracker=https://github.com/brych92/CRS_Magic/issues
 repository=https://github.com/brych92/CRS_Magic
 icon=icon.png
 experimental=false
 homepage=https://github.com/brych92/CRS_Magic
 changelog=Version 0.8.0:
+ * У режимі «Усі СК» відсіюються СК інших небесних тіл і типи, непридатні для підбору за 2D-центром; застарілі СК збережено.
+ * Відфільтрований каталог кешується в пам’яті до закриття QGIS, а за тривалої підготовки – також між сеансами з перевіркою відбитка каталогу.
+ * Для одноразової підготовки каталогу додано окремий прогрес 0–100% із жартівливим повідомленням про компіляцію шейдерів і кнопку скидання кешу в налаштуваннях.
+ * Службові попередження QGIS про недоступні переважні перетворення під час пошуку перенесено з Message Bar до журналу плагіна.
+ * Додано опційний фільтр за офіційною областю застосування СК, підказки для всіх пунктів меню та розгорнуте пояснення меж плагіна в довідці.
  * Прискорено перевірку кількох шарів: кожна можлива СК готується один раз і перевіряється для всіх центрів.
  * Використано стандартні операції QGIS/PROJ; додано швидкий режим і окремі параметри запасних (Fallback) та приблизних (Ballpark) перетворень.
  * Удосконалено визначення центру векторних даних і фактичних екстентів за геометріями об’єктів, зокрема для проблемних DXF.

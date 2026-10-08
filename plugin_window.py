@@ -111,6 +111,9 @@ class CRSResultsDialog(QDialog):
         self.redo_stack = []
         self.is_closing = False
         self.last_stats = None
+        self.phase_status = ''
+        self.phase_progress = 0
+        self.task_progress = 0
         self.status_suffix = ''
         self.search_finished = False
 
@@ -283,11 +286,41 @@ class CRSResultsDialog(QDialog):
     def set_task(self, task):
         self.task = task
         task.progressChanged.connect(self.set_progress)
+        task.phaseChanged.connect(self.set_phase_status)
+        task.phaseProgressChanged.connect(self.set_phase_progress)
+
+    def set_phase_status(self, status):
+        self.phase_status = str(status or '')
+        if self.phase_status:
+            self.phase_progress = 0
+            self.render_phase_status()
+            return
+
+        self.status_progress.setValue(self.task_progress)
+        if self.last_stats is not None:
+            self.render_stats()
+
+    def set_phase_progress(self, progress):
+        self.phase_progress = max(
+            0,
+            min(100, int(round(float(progress)))),
+        )
+        if self.phase_status:
+            self.render_phase_status()
+
+    def render_phase_status(self):
+        self.status_progress.setValue(self.phase_progress)
+        self.status_label.setText(
+            f'{self.phase_status} {self.phase_progress}%.'
+        )
 
     def set_progress(self, progress):
-        self.status_progress.setValue(
-            max(0, min(100, int(round(float(progress)))))
+        self.task_progress = max(
+            0,
+            min(100, int(round(float(progress)))),
         )
+        if not self.phase_status:
+            self.status_progress.setValue(self.task_progress)
 
     def layer_combo_tooltip(self, layer_ids):
         layer_names = []
@@ -738,6 +771,9 @@ class CRSResultsDialog(QDialog):
         self.render_stats()
 
     def render_stats(self):
+        if self.phase_status:
+            self.render_phase_status()
+            return
         if self.last_stats is None:
             return
         total, processed, success, failed, skipped, matched = self.last_stats
@@ -759,6 +795,7 @@ class CRSResultsDialog(QDialog):
         self.cancel_button.setEnabled(False)
         self.status_progress.setValue(100)
         self.task = None
+        self.phase_status = ''
         self.search_finished = True
         self.status_suffix = ' | Готово'
         self.rebuild_table()
@@ -767,12 +804,14 @@ class CRSResultsDialog(QDialog):
         self.flush_pending_results()
         self.cancel_button.setEnabled(False)
         self.task = None
+        self.phase_status = ''
         self.status_suffix = ''
         self.status_label.setText(f'Помилка: {failure}')
 
     def cancel_search(self):
         if self.task:
             self.task.cancel()
+            self.phase_status = ''
             self.status_suffix = ' | Скасування…'
             if self.last_stats is None:
                 self.status_label.setText('Скасування…')
